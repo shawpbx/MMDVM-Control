@@ -28,6 +28,14 @@ function deepMergeConfig(saved: Partial<MmdvmConfiguration>): MmdvmConfiguration
     station: { ...DEFAULT_MMDVM_CONFIG.station, ...(saved.station || {}) },
     modem: { ...DEFAULT_MMDVM_CONFIG.modem, ...(saved.modem || {}) },
     networks: { ...DEFAULT_MMDVM_CONFIG.networks, ...(saved.networks || {}) },
+    allstar: {
+      ...DEFAULT_MMDVM_CONFIG.allstar,
+      ...(saved.allstar || {}),
+      additionalNodes: Array.isArray(saved.allstar?.additionalNodes)
+        ? saved.allstar.additionalNodes
+        : DEFAULT_MMDVM_CONFIG.allstar.additionalNodes,
+    },
+    dvswitch: { ...DEFAULT_MMDVM_CONFIG.dvswitch, ...(saved.dvswitch || {}) },
     system: { ...DEFAULT_MMDVM_CONFIG.system, ...(saved.system || {}) },
   };
 }
@@ -73,6 +81,8 @@ export default function App() {
   }, []);
 
   const localNode = useLocalNode(handleSavedConfigLoaded);
+  const anyInstalled =
+    localNode.installed.mmdvmhost || localNode.installed.asterisk || localNode.installed.dvswitch;
 
   useEffect(() => {
     const root = document.documentElement;
@@ -88,17 +98,16 @@ export default function App() {
     }
   }, [darkMode]);
 
-  // Route to Dashboard automatically once authenticated if MMDVMHost is already installed
   useEffect(() => {
     if (!localNode.authenticated) {
       setDidAutoRoute(false);
       return;
     }
-    if (!didAutoRoute && (localNode.installed.mmdvmhost || !localNode.hostAvailable)) {
-      setView(localNode.installed.mmdvmhost ? 'dashboard' : 'configurator');
+    if (!didAutoRoute && (anyInstalled || !localNode.hostAvailable)) {
+      setView(anyInstalled ? 'dashboard' : 'configurator');
       setDidAutoRoute(true);
     }
-  }, [localNode.authenticated, localNode.installed.mmdvmhost, localNode.hostAvailable, didAutoRoute]);
+  }, [localNode.authenticated, anyInstalled, localNode.hostAvailable, didAutoRoute]);
 
   const issues = useMemo(
     () =>
@@ -138,10 +147,10 @@ export default function App() {
 
   if (localNode.checking) {
     return (
-      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center p-6 text-slate-600 dark:text-slate-300">
+      <div className="min-h-screen bg-blue-100 dark:bg-[#08172e] flex items-center justify-center p-6 text-slate-700 dark:text-blue-200">
         <div className="flex items-center gap-2.5 text-sm">
-          <Loader2 className="w-4 h-4 animate-spin text-sky-600 dark:text-sky-400" />
-          <span>Connecting to MMDVM Control...</span>
+          <Loader2 className="w-4 h-4 animate-spin text-blue-600 dark:text-sky-400" />
+          <span>Connecting to Node Control...</span>
         </div>
       </div>
     );
@@ -160,13 +169,13 @@ export default function App() {
   const isRunningJob = localNode.job.status === 'running';
 
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex">
-      {/* Desktop Sidebar */}
-      <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:shrink-0 bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800">
-        <div className="h-16 px-6 flex items-center gap-2.5 border-b border-slate-200 dark:border-slate-800">
-          <Radio className="w-5 h-5 text-sky-600 dark:text-sky-400 shrink-0" aria-hidden="true" />
-          <span className="font-display text-base font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap">
-            MMDVM Control
+    <div className="min-h-screen bg-blue-100 dark:bg-[#08172e] text-slate-900 dark:text-blue-50 flex">
+      {/* Desktop Deep-Blue Sidebar */}
+      <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:shrink-0 bg-[#0b2345] dark:bg-[#061224] text-blue-50 border-r border-blue-900/80">
+        <div className="h-16 px-6 flex items-center gap-2.5 border-b border-blue-800/80">
+          <Radio className="w-5 h-5 text-sky-400 shrink-0" aria-hidden="true" />
+          <span className="font-display text-base font-bold tracking-tight text-white whitespace-nowrap">
+            Node Control
           </span>
         </div>
 
@@ -181,8 +190,8 @@ export default function App() {
                 onClick={() => handleNavigate(item.id)}
                 className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap ${
                   active
-                    ? 'bg-sky-50 dark:bg-sky-950/50 text-sky-700 dark:text-sky-300'
-                    : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60 hover:text-slate-900 dark:hover:text-slate-100'
+                    ? 'bg-blue-600 text-white'
+                    : 'text-blue-200/85 hover:bg-blue-900/70 hover:text-white'
                 }`}
               >
                 <Icon className="w-4 h-4 shrink-0" aria-hidden="true" />
@@ -192,8 +201,8 @@ export default function App() {
           })}
         </nav>
 
-        <div className="p-4 border-t border-slate-200 dark:border-slate-800 space-y-2 text-xs text-slate-500 dark:text-slate-400">
-          <div className="font-mono truncate text-slate-800 dark:text-slate-200">
+        <div className="p-4 border-t border-blue-800/80 space-y-2 text-xs text-blue-200/80">
+          <div className="font-mono truncate text-white">
             {config.station.callsign} · {localNode.hostname}
           </div>
           <div className="flex items-center justify-between">
@@ -201,7 +210,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => localNode.logout()}
-              className="text-slate-600 dark:text-slate-300 hover:text-red-600 dark:hover:text-red-400 font-medium inline-flex items-center gap-1"
+              className="text-blue-200 hover:text-white font-medium inline-flex items-center gap-1"
             >
               <LogOut className="w-3.5 h-3.5" />
               <span>Sign out</span>
@@ -214,21 +223,21 @@ export default function App() {
       {mobileMenuOpen && (
         <div className="fixed inset-0 z-40 lg:hidden flex">
           <div
-            className="fixed inset-0 bg-slate-950/60"
+            className="fixed inset-0 bg-[#040c1a]/70"
             onClick={() => setMobileMenuOpen(false)}
             aria-hidden="true"
           />
-          <div className="relative z-50 w-64 max-w-[80vw] bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col">
-            <div className="h-14 px-4 flex items-center justify-between border-b border-slate-200 dark:border-slate-800">
+          <div className="relative z-50 w-64 max-w-[80vw] bg-[#0b2345] dark:bg-[#061224] text-blue-50 border-r border-blue-900 flex flex-col">
+            <div className="h-14 px-4 flex items-center justify-between border-b border-blue-800/80">
               <div className="flex items-center gap-2">
-                <Radio className="w-4 h-4 text-sky-600 dark:text-sky-400" />
-                <span className="font-display text-sm font-bold">MMDVM Control</span>
+                <Radio className="w-4 h-4 text-sky-400" />
+                <span className="font-display text-sm font-bold text-white">Node Control</span>
               </div>
               <button
                 type="button"
                 onClick={() => setMobileMenuOpen(false)}
                 aria-label="Close navigation menu"
-                className="p-2 text-slate-500 hover:text-slate-900 dark:hover:text-white"
+                className="p-2 text-blue-200 hover:text-white"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -244,8 +253,8 @@ export default function App() {
                     onClick={() => handleNavigate(item.id)}
                     className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-sm font-medium ${
                       active
-                        ? 'bg-sky-50 dark:bg-sky-950/50 text-sky-700 dark:text-sky-300'
-                        : 'text-slate-600 dark:text-slate-400'
+                        ? 'bg-blue-600 text-white'
+                        : 'text-blue-200 hover:bg-blue-900/70'
                     }`}
                   >
                     <Icon className="w-4 h-4 shrink-0" />
@@ -254,11 +263,11 @@ export default function App() {
                 );
               })}
             </nav>
-            <div className="p-4 border-t border-slate-200 dark:border-slate-800">
+            <div className="p-4 border-t border-blue-800/80">
               <button
                 type="button"
                 onClick={() => localNode.logout()}
-                className="w-full min-h-[40px] px-3 py-2 rounded-md border border-slate-300 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 flex items-center justify-center gap-2"
+                className="w-full min-h-[40px] px-3 py-2 rounded-md border border-blue-700 text-xs font-medium text-blue-100 flex items-center justify-center gap-2"
               >
                 <LogOut className="w-3.5 h-3.5" />
                 <span>Sign Out ({localNode.username})</span>
@@ -271,20 +280,20 @@ export default function App() {
       {/* Main Content Shell */}
       <div className="flex-1 min-w-0 flex flex-col">
         {/* Top Bar Contract: Breadcrumb Left / Primary Action Right */}
-        <header className="h-16 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-4 sm:px-6 lg:px-8 flex items-center justify-between gap-4 shrink-0">
+        <header className="h-16 bg-blue-50/90 dark:bg-[#0b1f3b] border-b border-blue-200 dark:border-blue-800/80 px-4 sm:px-6 lg:px-8 flex items-center justify-between gap-4 shrink-0">
           <div className="flex items-center gap-3 min-w-0">
             <button
               type="button"
               onClick={() => setMobileMenuOpen(true)}
               aria-label="Open navigation menu"
-              className="lg:hidden p-2 -ml-1 rounded-md text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+              className="lg:hidden p-2 -ml-1 rounded-md text-blue-900 dark:text-blue-200 hover:bg-blue-100 dark:hover:bg-blue-900/50"
             >
               <Menu className="w-5 h-5" />
             </button>
 
             <div className="flex items-center gap-2 text-sm min-w-0">
-              <span className="text-slate-500 dark:text-slate-400 whitespace-nowrap">MMDVM Control</span>
-              <span className="text-slate-300 dark:text-slate-700" aria-hidden="true">/</span>
+              <span className="text-blue-800/80 dark:text-blue-300/80 whitespace-nowrap">Node Control</span>
+              <span className="text-blue-300 dark:text-blue-700" aria-hidden="true">/</span>
               <span className="font-semibold text-slate-900 dark:text-white truncate">
                 {VIEW_TITLES[view]}
               </span>
@@ -296,17 +305,17 @@ export default function App() {
               type="button"
               onClick={() => setDarkMode((d) => !d)}
               aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-              className="p-2 rounded-md border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+              className="p-2 rounded-md border border-blue-200 dark:border-blue-700 bg-white dark:bg-[#0d2240] text-slate-700 dark:text-blue-200 hover:bg-blue-100/60 dark:hover:bg-blue-900/50"
             >
               {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
             </button>
 
-            {localNode.installed.mmdvmhost ? (
+            {anyInstalled ? (
               <button
                 type="button"
                 disabled={hasErrors || isRunningJob}
                 onClick={handleApplyConfig}
-                className="min-h-[38px] px-3.5 py-1.5 rounded-md bg-sky-600 hover:bg-sky-700 disabled:opacity-50 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                className="min-h-[38px] px-3.5 py-1.5 rounded-md bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
               >
                 {isRunningJob ? (
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -319,17 +328,17 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => handleNavigate('installer')}
-                className="min-h-[38px] px-3.5 py-1.5 rounded-md bg-sky-600 hover:bg-sky-700 text-white text-xs font-semibold whitespace-nowrap shrink-0"
+                className="min-h-[38px] px-3.5 py-1.5 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold whitespace-nowrap shrink-0"
               >
-                Install MMDVM
+                Install Stack
               </button>
             )}
           </div>
         </header>
 
-        {/* Active Job Progress Strip (visible across tabs while applying/installing) */}
+        {/* Active Job Progress Strip */}
         {isRunningJob && view !== 'installer' && (
-          <div className="bg-sky-600 text-white px-4 sm:px-6 lg:px-8 py-2 text-xs flex items-center justify-between gap-4">
+          <div className="bg-blue-700 text-white px-4 sm:px-6 lg:px-8 py-2 text-xs flex items-center justify-between gap-4">
             <div className="flex items-center gap-2 min-w-0">
               <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
               <span className="truncate font-medium">

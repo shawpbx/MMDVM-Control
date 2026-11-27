@@ -1,6 +1,13 @@
 export type WorkspaceView = 'dashboard' | 'configurator' | 'installer' | 'files';
 
-export type ConfigTab = 'station' | 'modem' | 'networks' | 'system';
+export type ConfigTab =
+  | 'station'
+  | 'modem'
+  | 'networks'
+  | 'allstar-nodes'
+  | 'allstar-audio'
+  | 'dvswitch'
+  | 'system';
 
 export type ValidationSeverity = 'error' | 'warning';
 
@@ -33,6 +40,7 @@ export interface StationConfig {
 }
 
 export interface ModemConfig {
+  enabled: boolean;
   modemModel: string;
   protocol: 'uart' | 'null';
   uartPort: string;
@@ -67,6 +75,64 @@ export interface NetworksConfig {
   nxdnRan: number;
 }
 
+export type AslRadioInterface = 'simpleusb' | 'usbradio' | 'pseudo';
+export type AslDuplexMode = '0' | '1' | '2';
+
+export interface ExtraAllStarNode {
+  id: string;
+  nodeNumber: string;
+  nodePassword: string;
+  radioInterface: AslRadioInterface;
+  duplexMode: AslDuplexMode;
+}
+
+export interface AllStarConfig {
+  enabled: boolean;
+  nodeNumber: string;
+  nodePassword: string;
+  callsign: string;
+  iaxPort: number;
+  registrationServer: string;
+  radioInterface: AslRadioInterface;
+  duplexMode: AslDuplexMode;
+  additionalNodes: ExtraAllStarNode[];
+  // SimpleUSB FOB audio & hardware signaling
+  carrierFrom: 'usbinvert' | 'usb' | 'vox' | 'no';
+  ctcssFrom: 'no' | 'usb' | 'usbinvert';
+  rxBoost: boolean;
+  pttInvert: boolean;
+  plFilter: boolean;
+  deEmphasis: boolean;
+  preEmphasis: boolean;
+  txMixA: 'voice' | 'composite' | 'no';
+  // Asterisk Manager Interface (AMI) & Allmon3
+  amiUser: string;
+  amiSecret: string;
+  installAllmon3: boolean;
+}
+
+export type DvSwitchMode = 'DMR' | 'YSF' | 'DSTAR' | 'P25' | 'NXDN';
+
+export interface DvSwitchConfig {
+  enabled: boolean;
+  bridgeNodeNumber: string;
+  usrpHost: string;
+  usrpTxPort: number;
+  usrpRxPort: number;
+  defaultMode: DvSwitchMode;
+  dmrId: string;
+  repeaterId: string;
+  defaultTalkgroup: string;
+  dmrMasterHost: string;
+  dmrMasterPort: number;
+  dmrMasterPassword: string;
+  ambeMode: 'md380-emu' | 'thumbdv';
+  tlvTxPort: number;
+  tlvRxPort: number;
+  usrpGain: number;
+  tlvGain: number;
+}
+
 export interface SystemConfig {
   hostname: string;
   timezone: string;
@@ -79,6 +145,8 @@ export interface MmdvmConfiguration {
   station: StationConfig;
   modem: ModemConfig;
   networks: NetworksConfig;
+  allstar: AllStarConfig;
+  dvswitch: DvSwitchConfig;
   system: SystemConfig;
 }
 
@@ -114,6 +182,7 @@ export interface GeneratedFile {
   filename: string;
   targetPath: string;
   language: 'ini' | 'bash' | 'systemd';
+  category: 'MMDVM' | 'AllStarLink' | 'DVSwitch' | 'Installer';
   description: string;
   content: string;
 }

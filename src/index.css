@@ -12,6 +12,11 @@
     font-family: var(--font-body);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    background-color: #dbeafe;
+  }
+
+  html.dark {
+    background-color: #08172e;
   }
 
   h1, h2, h3, h4, .font-display {

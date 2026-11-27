@@ -16,7 +16,26 @@ export interface MmdvmUserActivity {
   active: boolean;
 }
 
+export interface ConnectedAslNode {
+  node: string;
+  localNode: string;
+  description: string;
+  mode: string;
+  direction: string;
+  elapsed: string;
+  keyed: boolean;
+}
+
+export interface LocalAslNodeStatus {
+  node: string;
+  registered: string;
+  connectedCount: number;
+  connectedNodes: ConnectedAslNode[];
+}
+
 export interface InstalledStatus {
+  asterisk: boolean;
+  dvswitch: boolean;
   mmdvmhost: boolean;
   dmrgateway: boolean;
   configWritten: boolean;
@@ -43,6 +62,11 @@ export interface LiveTelemetry {
   detectedSerialPorts: string[];
   installed: InstalledStatus;
   services: Record<string, string>;
+  allstar: {
+    active: boolean;
+    nodes: LocalAslNodeStatus[];
+    totalConnected: number;
+  };
   dmrMasterConnected: boolean;
   mmdvmhostLastError: string | null;
   dmrgatewayLastError: string | null;
@@ -50,15 +74,23 @@ export interface LiveTelemetry {
   recentUsers: MmdvmUserActivity[];
 }
 
-export type ServiceUnit = 'mmdvmhost' | 'dmrgateway';
+export type ServiceUnit =
+  | 'asterisk'
+  | 'allmon3'
+  | 'mmdvmhost'
+  | 'dmrgateway'
+  | 'md380-emu'
+  | 'analog_bridge'
+  | 'mmdvm_bridge';
 export type ServiceAction = 'start' | 'stop' | 'restart';
+export type AslCommandAction = 'connect' | 'monitor' | 'disconnect' | 'disconnect_all';
 
 const EMPTY_JOB: JobState = {
   mode: 'idle',
   status: 'idle',
   step: '',
   stepIndex: 0,
-  totalSteps: 4,
+  totalSteps: 6,
   startedAt: null,
   finishedAt: null,
   exitCode: null,
@@ -88,6 +120,8 @@ export interface LocalNodeController {
   job: JobState;
   serviceBusy: string | null;
   serviceMessage: string | null;
+  aslBusy: boolean;
+  aslMessage: string | null;
   logsUnit: ServiceUnit;
   setLogsUnit: (unit: ServiceUnit) => void;
   serviceLogs: string[];
@@ -101,6 +135,11 @@ export interface LocalNodeController {
   startInstall: (config: MmdvmConfiguration) => Promise<boolean>;
   applyConfigOnly: (config: MmdvmConfiguration) => Promise<boolean>;
   controlService: (unit: ServiceUnit, action: ServiceAction) => Promise<boolean>;
+  sendAslCommand: (
+    localNode: string,
+    action: AslCommandAction,
+    targetNode?: string
+  ) => Promise<boolean>;
 }
 
 export function useLocalNode(
@@ -108,7 +147,7 @@ export function useLocalNode(
 ): LocalNodeController {
   const [checking, setChecking] = useState(true);
   const [hostAvailable, setHostAvailable] = useState(false);
-  const [hostname, setHostname] = useState('mmdvm-hotspot');
+  const [hostname, setHostname] = useState('mmdvm-asl-node');
   const [isRoot, setIsRoot] = useState(false);
 
   const [authConfigured, setAuthConfigured] = useState(false);
@@ -119,20 +158,26 @@ export function useLocalNode(
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
-  // Kept strictly in React state / ref memory (never localStorage/sessionStorage)
   const tokenRef = useRef<string | null>(null);
   const previewAccountRef = useRef<{ username: string; password: string } | null>(null);
   const loadedConfigOnceRef = useRef(false);
 
   const [installed, setInstalled] = useState<InstalledStatus>({
+    asterisk: false,
+    dvswitch: false,
     mmdvmhost: false,
     dmrgateway: false,
     configWritten: false,
   });
   const [detectedSerialPorts, setDetectedSerialPorts] = useState<string[]>([]);
   const [services, setServices] = useState<Record<string, string>>({
+    asterisk: 'inactive',
+    allmon3: 'inactive',
     mmdvmhost: 'inactive',
     dmrgateway: 'inactive',
+    'md380-emu': 'inactive',
+    analog_bridge: 'inactive',
+    mmdvm_bridge: 'inactive',
   });
   const [savedConfig, setSavedConfig] = useState<MmdvmConfiguration | null>(null);
   const [live, setLive] = useState<LiveTelemetry | null>(null);
@@ -140,6 +185,8 @@ export function useLocalNode(
   const [job, setJob] = useState<JobState>(EMPTY_JOB);
   const [serviceBusy, setServiceBusy] = useState<string | null>(null);
   const [serviceMessage, setServiceMessage] = useState<string | null>(null);
+  const [aslBusy, setAslBusy] = useState(false);
+  const [aslMessage, setAslMessage] = useState<string | null>(null);
   const [logsUnit, setLogsUnit] = useState<ServiceUnit>('mmdvmhost');
   const [serviceLogs, setServiceLogs] = useState<string[]>([]);
   const [logsLoading, setLogsLoading] = useState(false);
@@ -252,7 +299,6 @@ export function useLocalNode(
     await Promise.all([fetchStatus(), fetchLive(), refreshLogs()]);
   }, [fetchLive, fetchStatus, refreshLogs]);
 
-  // Initial host & auth status probe
   useEffect(() => {
     let active = true;
     (async () => {
@@ -263,7 +309,7 @@ export function useLocalNode(
           const data = await res.json();
           if (active && data.hostAvailable) {
             setHostAvailable(true);
-            setHostname(data.hostname || 'mmdvm-hotspot');
+            setHostname(data.hostname || 'mmdvm-asl-node');
             setIsRoot(Boolean(data.isRoot));
             setAuthConfigured(Boolean(data.authConfigured));
             setEnvManaged(Boolean(data.envManaged));
@@ -283,7 +329,6 @@ export function useLocalNode(
     };
   }, []);
 
-  // Load initial host data upon authentication
   useEffect(() => {
     if (!authenticated || !hostAvailable) return;
     fetchStatus();
@@ -291,7 +336,6 @@ export function useLocalNode(
     refreshLogs();
   }, [authenticated, hostAvailable, fetchStatus, fetchLive, refreshLogs]);
 
-  // Periodic live telemetry polling (5s)
   useEffect(() => {
     if (!authenticated || !hostAvailable || !autoRefresh) return;
     const timer = window.setInterval(() => {
@@ -300,7 +344,6 @@ export function useLocalNode(
     return () => window.clearInterval(timer);
   }, [authenticated, hostAvailable, autoRefresh, fetchLive]);
 
-  // Poll active install/apply job logs (1.2s)
   useEffect(() => {
     if (!authenticated || !hostAvailable || job.status !== 'running') return;
     const timer = window.setInterval(async () => {
@@ -329,7 +372,6 @@ export function useLocalNode(
     return () => window.clearInterval(timer);
   }, [authenticated, hostAvailable, job.status, authHeaders, handleUnauthorized, fetchStatus, fetchLive, refreshLogs]);
 
-  // Refresh logs when switching unit tab
   useEffect(() => {
     if (!authenticated) return;
     refreshLogs(logsUnit);
@@ -367,7 +409,7 @@ export function useLocalNode(
         setAuthenticated(true);
         return true;
       } catch {
-        setAuthError('Unable to reach the local MMDVM WebGUI server.');
+        setAuthError('Unable to reach the local WebGUI server.');
         return false;
       } finally {
         setAuthBusy(false);
@@ -409,7 +451,7 @@ export function useLocalNode(
         setAuthenticated(true);
         return true;
       } catch {
-        setAuthError('Unable to reach the local MMDVM WebGUI server.');
+        setAuthError('Unable to reach the local WebGUI server.');
         return false;
       } finally {
         setAuthBusy(false);
@@ -426,7 +468,7 @@ export function useLocalNode(
           headers: authHeaders(),
         });
       } catch {
-        // Best-effort server session revocation
+        // Best-effort revocation
       }
     }
     tokenRef.current = null;
@@ -451,12 +493,10 @@ export function useLocalNode(
           body: JSON.stringify({ currentPassword, newPassword }),
         });
         const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          return data.error || 'Failed to update password.';
-        }
+        if (!res.ok) return data.error || 'Failed to update password.';
         return null;
       } catch {
-        return 'Unable to reach the local MMDVM WebGUI server.';
+        return 'Unable to reach the local WebGUI server.';
       }
     },
     [authHeaders, hostAvailable, username]
@@ -468,24 +508,39 @@ export function useLocalNode(
         setJob({
           mode: 'install',
           status: 'succeeded',
-          step: 'Preview Mode — Download install-mmdvm.sh or run on Raspberry Pi / Debian',
-          stepIndex: 4,
-          totalSteps: 4,
+          step: 'Preview Mode — Download install-node.sh or run on Raspberry Pi / Debian',
+          stepIndex: 6,
+          totalSteps: 6,
           startedAt: new Date().toISOString(),
           finishedAt: new Date().toISOString(),
           exitCode: 0,
           error: null,
           logs: [
-            '[PREVIEW] On your Raspberry Pi / Debian host, clicking Install MMDVM Stack runs:',
-            '=== [1/4] Install Build Dependencies, Configure Host & MMDVM User ===',
-            '=== [2/4] Clone, Compile & Install g4klx/MMDVMHost ===',
-            '=== [3/4] Clone, Compile & Install g4klx/DMRGateway ===',
-            '=== [4/4] Write /etc/mmdvm/MMDVM.ini & DMRGateway.ini, Enable & Start Services ===',
-            '[PREVIEW] Use "Download install-mmdvm.sh" or deploy this WebGUI via install.sh on your Pi.',
+            '[PREVIEW] Full installer pipeline on Raspberry Pi / Debian 12-13:',
+            '=== [1/6] Install System Dependencies & Configure Host ===',
+            `=== [2/6] ${config.allstar.enabled ? `Install AllStarLink 3 & Configure Node ${config.allstar.nodeNumber}` : 'AllStarLink 3 Skipped'} ===`,
+            `=== [3/6] ${config.dvswitch.enabled ? 'Install DVSwitch (Analog_Bridge, MMDVM_Bridge, md380-emu)' : 'DVSwitch Skipped'} ===`,
+            `=== [4/6] ${config.modem.enabled ? 'Clone, Compile & Install g4klx/MMDVMHost' : 'MMDVMHost Skipped'} ===`,
+            `=== [5/6] ${config.modem.enabled ? 'Clone, Compile & Install g4klx/DMRGateway' : 'DMRGateway Skipped'} ===`,
+            '=== [6/6] Finalize Configs, Firewall & Start Services ===',
           ],
         });
-        setInstalled({ mmdvmhost: true, dmrgateway: true, configWritten: true });
-        setServices({ mmdvmhost: 'active', dmrgateway: config.networks.dmrEnable ? 'active' : 'inactive' });
+        setInstalled({
+          asterisk: config.allstar.enabled,
+          dvswitch: config.dvswitch.enabled,
+          mmdvmhost: config.modem.enabled,
+          dmrgateway: config.modem.enabled && config.networks.dmrEnable,
+          configWritten: true,
+        });
+        setServices({
+          asterisk: config.allstar.enabled ? 'active' : 'inactive',
+          allmon3: config.allstar.enabled && config.allstar.installAllmon3 ? 'active' : 'inactive',
+          mmdvmhost: config.modem.enabled ? 'active' : 'inactive',
+          dmrgateway: config.modem.enabled && config.networks.dmrEnable ? 'active' : 'inactive',
+          'md380-emu': config.dvswitch.enabled && config.dvswitch.ambeMode === 'md380-emu' ? 'active' : 'inactive',
+          analog_bridge: config.dvswitch.enabled ? 'active' : 'inactive',
+          mmdvm_bridge: config.dvswitch.enabled ? 'active' : 'inactive',
+        });
         setSavedConfig(config);
         return true;
       }
@@ -512,14 +567,14 @@ export function useLocalNode(
         setJob({
           mode: 'install',
           status: 'running',
-          step: 'Starting MMDVM installer...',
+          step: 'Starting installation...',
           stepIndex: 0,
-          totalSteps: 4,
+          totalSteps: 6,
           startedAt: new Date().toISOString(),
           finishedAt: null,
           exitCode: null,
           error: null,
-          logs: ['Starting full MMDVMHost + DMRGateway installation...'],
+          logs: ['Starting full AllStarLink 3 + DVSwitch + MMDVM installation...'],
         });
         return true;
       } catch {
@@ -552,11 +607,11 @@ export function useLocalNode(
           logs: [
             '[PREVIEW] Config-only update (no package reinstall):',
             '=== [1/3] Save Configuration & Update Host Settings ===',
-            '=== [2/3] Write /etc/mmdvm/MMDVM.ini & /etc/mmdvm/DMRGateway.ini ===',
-            '=== [3/3] Reload & Restart dmrgateway.service + mmdvmhost.service ===',
+            '=== [2/3] Write AllStarLink (/etc/asterisk/*.conf) & MMDVM (/etc/mmdvm/*.ini) ===',
+            '=== [3/3] Reload & Restart Configured Services ===',
           ],
         });
-        setServiceMessage('Configuration saved in Preview Mode. Deploy on your Pi to write /etc/mmdvm/*.ini directly.');
+        setServiceMessage('Configuration saved in Preview Mode. Deploy on your Pi to write config files directly.');
         return true;
       }
       try {
@@ -582,14 +637,14 @@ export function useLocalNode(
         setJob({
           mode: 'apply',
           status: 'running',
-          step: 'Writing /etc/mmdvm/MMDVM.ini and DMRGateway.ini...',
+          step: 'Applying configuration files...',
           stepIndex: 0,
           totalSteps: 3,
           startedAt: new Date().toISOString(),
           finishedAt: null,
           exitCode: null,
           error: null,
-          logs: ['Applying edited MMDVM configuration files (no reinstall)...'],
+          logs: ['Applying edited AllStarLink & MMDVM config files (no reinstall)...'],
         });
         return true;
       } catch {
@@ -649,6 +704,47 @@ export function useLocalNode(
     [authHeaders, fetchLive, handleUnauthorized, hostAvailable, refreshLogs]
   );
 
+  const sendAslCommand = useCallback(
+    async (localNode: string, action: AslCommandAction, targetNode?: string): Promise<boolean> => {
+      setAslBusy(true);
+      setAslMessage(null);
+      if (!hostAvailable) {
+        setAslMessage(
+          action === 'disconnect_all'
+            ? `Preview Mode: disconnect all links on node ${localNode}.`
+            : `Preview Mode: ${action} node ${targetNode} on local node ${localNode}.`
+        );
+        setAslBusy(false);
+        return true;
+      }
+      try {
+        const res = await fetch('/api/asl/command', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({ localNode, action, targetNode: targetNode || '' }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 401) {
+          handleUnauthorized();
+          return false;
+        }
+        if (!res.ok) {
+          setAslMessage(data.error || 'AllStarLink command failed.');
+          return false;
+        }
+        setAslMessage(data.output || 'AllStarLink command sent.');
+        await fetchLive();
+        return true;
+      } catch {
+        setAslMessage('Unable to reach /api/asl/command.');
+        return false;
+      } finally {
+        setAslBusy(false);
+      }
+    },
+    [authHeaders, fetchLive, handleUnauthorized, hostAvailable]
+  );
+
   return {
     checking,
     hostAvailable,
@@ -671,6 +767,8 @@ export function useLocalNode(
     job,
     serviceBusy,
     serviceMessage,
+    aslBusy,
+    aslMessage,
     logsUnit,
     setLogsUnit,
     serviceLogs,
@@ -684,5 +782,6 @@ export function useLocalNode(
     startInstall,
     applyConfigOnly,
     controlService,
+    sendAslCommand,
   };
 }

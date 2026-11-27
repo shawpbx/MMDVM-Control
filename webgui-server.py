@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-MMDVM WebGUI Installer & Post-Install Configurator Server
-Provides authenticated login, pre-install MMDVMHost + DMRGateway build & setup,
-fast post-install config-only updates (no reinstall), live service/user telemetry,
-and journal log inspection for Raspberry Pi OS & Debian 12/13.
+MMDVM & AllStarLink 3 WebGUI Installer & Post-Install Configurator Server
+Provides authenticated login, pre-install AllStarLink 3 + MMDVMHost + DMRGateway
+installation, fast post-install config-only updates (no reinstall), live AllStarLink
+connected nodes + MMDVM user telemetry, service controls, and journal log viewing.
 """
 
 import hashlib
@@ -40,13 +40,12 @@ SESSION_TTL_SECONDS = 8 * 3600
 MAX_LOGIN_FAILURES = 5
 LOGIN_WINDOW_SECONDS = 60
 
-ALLOWED_SERVICES = ("mmdvmhost", "dmrgateway")
+ALLOWED_SERVICES = ("asterisk", "allmon3", "mmdvmhost", "dmrgateway", "md380-emu", "analog_bridge", "mmdvm_bridge")
 ALLOWED_ACTIONS = ("start", "stop", "restart")
+ALLOWED_ASL_ACTIONS = ("connect", "monitor", "disconnect", "disconnect_all")
 
 auth_lock = threading.Lock()
-# token -> {"username": str, "expires": float}
 sessions: dict[str, dict] = {}
-# ip -> list[float] timestamps of failed logins
 login_failures: dict[str, list[float]] = {}
 
 job_lock = threading.Lock()
@@ -55,7 +54,7 @@ job_state: dict = {
     "status": "idle",  # idle | running | succeeded | failed
     "step": "",
     "stepIndex": 0,
-    "totalSteps": 4,
+    "totalSteps": 6,
     "startedAt": None,
     "finishedAt": None,
     "exitCode": None,
@@ -253,6 +252,17 @@ def _mhz_to_hz(mhz_raw: str) -> int:
     return hz
 
 
+def _detect_codename() -> str:
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VERSION_CODENAME="):
+                    return line.split("=", 1)[1].strip().strip('"').lower()
+    except OSError:
+        pass
+    return "bookworm"
+
+
 def _validate_config(cfg: dict) -> dict:
     if not isinstance(cfg, dict):
         raise ValueError("Configuration must be a JSON object.")
@@ -260,119 +270,216 @@ def _validate_config(cfg: dict) -> dict:
     st = cfg.get("station")
     md = cfg.get("modem")
     nw = cfg.get("networks")
+    asl = cfg.get("allstar") or {}
+    dvs = cfg.get("dvswitch") or {}
     sy = cfg.get("system")
-    if not all(isinstance(x, dict) for x in (st, md, nw, sy)):
-        raise ValueError("Missing required sections: station, modem, networks, system.")
+    if not all(isinstance(x, dict) for x in (st, md, nw, asl, dvs, sy)):
+        raise ValueError("Missing required configuration sections.")
 
-    callsign = _clean_line(st.get("callsign", "")).upper()
-    if not re.fullmatch(r"[A-Z0-9]{3,10}", callsign):
-        raise ValueError("Callsign must be 3–10 alphanumeric characters.")
+    mmdvm_enabled = bool(md.get("enabled", True))
+    asl_enabled = bool(asl.get("enabled", False))
+    dvs_enabled = bool(dvs.get("enabled", False))
+    if not mmdvm_enabled and not asl_enabled and not dvs_enabled:
+        raise ValueError("Enable at least one service (MMDVMHost, AllStarLink 3, or DVSwitch).")
 
-    dmr_id = _clean_line(st.get("dmrId", ""))
-    dmr_enable = bool(nw.get("dmrEnable", True))
-    if dmr_enable and not re.fullmatch(r"\d{6,7}", dmr_id):
-        raise ValueError("DMR ID must be 6–7 digits when DMR is enabled.")
-    if dmr_id and not re.fullmatch(r"\d{6,7}", dmr_id):
-        raise ValueError("DMR ID must be 6–7 digits.")
-
+    # Station & MMDVM fields
+    callsign = _clean_line(st.get("callsign", "N0CALL")).upper() or "N0CALL"
+    dmr_id = _clean_line(st.get("dmrId", "3100000")) or "3100000"
     essid = _clean_line(st.get("essidSuffix", ""))
-    if essid and not re.fullmatch(r"\d{2}", essid):
-        raise ValueError("ESSID suffix must be 2 digits (e.g. 01) or blank.")
-
-    rx_mhz = _clean_line(st.get("rxFrequencyMhz", "446.8000"))
-    tx_mhz = _clean_line(st.get("txFrequencyMhz", "446.8000"))
-    rx_hz = _mhz_to_hz(rx_mhz)
-    tx_hz = _mhz_to_hz(tx_mhz)
+    rx_mhz = _clean_line(st.get("rxFrequencyMhz", "446.8000")) or "446.8000"
+    tx_mhz = _clean_line(st.get("txFrequencyMhz", "446.8000")) or "446.8000"
+    rx_hz = _mhz_to_hz(rx_mhz) if mmdvm_enabled else 446_800_000
+    tx_hz = _mhz_to_hz(tx_mhz) if mmdvm_enabled else 446_800_000
 
     rx_offset = int(st.get("rxOffset", 0))
     tx_offset = int(st.get("txOffset", 0))
-    if not (-5000 <= rx_offset <= 5000) or not (-5000 <= tx_offset <= 5000):
-        raise ValueError("RX/TX offsets must be between -5000 and 5000 Hz.")
-
     rf_power = int(st.get("rfPower", 100))
-    if not (1 <= rf_power <= 100):
-        raise ValueError("RF Power must be between 1 and 100%.")
-
     cw_time = int(st.get("cwIdTimeMinutes", 10))
-    if not (1 <= cw_time <= 60):
-        raise ValueError("CW ID interval must be between 1 and 60 minutes.")
-
     lat = _clean_line(st.get("latitude", "0.0")) or "0.0"
     lon = _clean_line(st.get("longitude", "0.0")) or "0.0"
-    if not re.fullmatch(r"-?\d{1,3}(\.\d+)?", lat) or not re.fullmatch(r"-?\d{1,3}(\.\d+)?", lon):
-        raise ValueError("Latitude and Longitude must be valid decimal numbers.")
 
     protocol = _clean_line(md.get("protocol", "uart"))
     uart_port = _clean_line(md.get("uartPort", "/dev/ttyAMA0"))
-    if protocol == "null" or uart_port == "null":
-        protocol = "null"
-        uart_port = "null"
-    else:
-        protocol = "uart"
-        if not re.fullmatch(r"/dev/[A-Za-z0-9._-]+", uart_port):
-            raise ValueError("Modem UARTPort must be a valid /dev/ device path or 'null'.")
-
     uart_speed = int(md.get("uartSpeed", 115200))
-    if uart_speed not in (115200, 230400, 460800):
-        raise ValueError("UART baud rate must be 115200, 230400, or 460800.")
-
     tx_delay = int(md.get("txDelay", 100))
     dmr_delay = int(md.get("dmrDelay", 0))
     rx_level = int(md.get("rxLevel", 50))
     tx_level = int(md.get("txLevel", 50))
-    if not (0 <= tx_delay <= 500) or not (0 <= dmr_delay <= 500):
-        raise ValueError("TXDelay and DMRDelay must be between 0 and 500.")
-    if not (0 <= rx_level <= 100) or not (0 <= tx_level <= 100):
-        raise ValueError("RXLevel and TXLevel must be between 0 and 100.")
 
+    dmr_enable = bool(nw.get("dmrEnable", True))
     ysf_enable = bool(nw.get("ysfEnable", False))
     dstar_enable = bool(nw.get("dstarEnable", False))
     p25_enable = bool(nw.get("p25Enable", False))
     nxdn_enable = bool(nw.get("nxdnEnable", False))
-    if not any((dmr_enable, ysf_enable, dstar_enable, p25_enable, nxdn_enable)):
-        raise ValueError("Enable at least one digital voice mode.")
-
     dmr_cc = int(nw.get("dmrColorCode", 1))
-    if not (0 <= dmr_cc <= 15):
-        raise ValueError("DMR Color Code must be between 0 and 15.")
-
     dmr_host = _clean_line(nw.get("dmrMasterHost", "3102.repeater.net"))
     dmr_port = int(nw.get("dmrMasterPort", 62031))
     dmr_pass = _clean_line(nw.get("dmrMasterPassword", ""))
     dmr_name = _clean_line(nw.get("dmrMasterName", "BrandMeister")) or "BrandMeister"
-    if dmr_enable:
-        if not re.fullmatch(r"[a-zA-Z0-9.-]+", dmr_host):
-            raise ValueError("Invalid DMR master hostname.")
-        if not (1024 <= dmr_port <= 65535):
-            raise ValueError("DMR master port must be between 1024 and 65535.")
-
     ysf_host = _clean_line(nw.get("ysfGatewayHost", "127.0.0.1")) or "127.0.0.1"
-    if not re.fullmatch(r"[a-zA-Z0-9.-]+", ysf_host):
-        raise ValueError("Invalid YSF gateway host.")
     ysf_port = int(nw.get("ysfGatewayPort", 4200))
-    if not (1024 <= ysf_port <= 65535):
-        raise ValueError("YSF gateway port must be between 1024 and 65535.")
-
     dstar_mod = _clean_line(nw.get("dstarModule", "B")).upper()
     if dstar_mod not in ("A", "B", "C", "D"):
         dstar_mod = "B"
-
     p25_nac = _clean_line(nw.get("p25Nac", "293")).upper() or "293"
-    if not re.fullmatch(r"[0-9A-F]{1,3}", p25_nac):
-        raise ValueError("P25 NAC must be a valid hex code (e.g. 293).")
-
     nxdn_ran = int(nw.get("nxdnRan", 1))
-    if not (0 <= nxdn_ran <= 63):
-        raise ValueError("NXDN RAN must be between 0 and 63.")
 
-    hostname = _clean_line(sy.get("hostname", "mmdvm-hotspot"))
+    if mmdvm_enabled:
+        if not re.fullmatch(r"[A-Z0-9]{3,10}", callsign):
+            raise ValueError("MMDVM Callsign must be 3–10 alphanumeric characters.")
+        if dmr_enable and not re.fullmatch(r"\d{6,7}", dmr_id):
+            raise ValueError("DMR ID must be 6–7 digits when DMR is enabled.")
+        if essid and not re.fullmatch(r"\d{2}", essid):
+            raise ValueError("ESSID suffix must be 2 digits or blank.")
+        if not (-5000 <= rx_offset <= 5000) or not (-5000 <= tx_offset <= 5000):
+            raise ValueError("RX/TX offsets must be between -5000 and 5000 Hz.")
+        if not (1 <= rf_power <= 100):
+            raise ValueError("RF Power must be between 1 and 100%.")
+        if not (1 <= cw_time <= 60):
+            raise ValueError("CW ID interval must be between 1 and 60 minutes.")
+        if not re.fullmatch(r"-?\d{1,3}(\.\d+)?", lat) or not re.fullmatch(r"-?\d{1,3}(\.\d+)?", lon):
+            raise ValueError("Latitude and Longitude must be valid decimal numbers.")
+        if protocol == "null" or uart_port == "null":
+            protocol = "null"
+            uart_port = "null"
+        else:
+            protocol = "uart"
+            if not re.fullmatch(r"/dev/[A-Za-z0-9._-]+", uart_port):
+                raise ValueError("Modem UARTPort must be a valid /dev/ device path or 'null'.")
+        if uart_speed not in (115200, 230400, 460800):
+            raise ValueError("UART baud rate must be 115200, 230400, or 460800.")
+        if not (0 <= tx_delay <= 500) or not (0 <= dmr_delay <= 500):
+            raise ValueError("TXDelay and DMRDelay must be between 0 and 500.")
+        if not (0 <= rx_level <= 100) or not (0 <= tx_level <= 100):
+            raise ValueError("RXLevel and TXLevel must be between 0 and 100.")
+        if not any((dmr_enable, ysf_enable, dstar_enable, p25_enable, nxdn_enable)):
+            raise ValueError("Enable at least one MMDVM digital voice mode.")
+        if not (0 <= dmr_cc <= 15):
+            raise ValueError("DMR Color Code must be between 0 and 15.")
+        if dmr_enable:
+            if not re.fullmatch(r"[a-zA-Z0-9.-]+", dmr_host):
+                raise ValueError("Invalid DMR master hostname.")
+            if not (1024 <= dmr_port <= 65535):
+                raise ValueError("DMR master port must be between 1024 and 65535.")
+        if not re.fullmatch(r"[a-zA-Z0-9.-]+", ysf_host):
+            raise ValueError("Invalid YSF gateway host.")
+        if not (1024 <= ysf_port <= 65535):
+            raise ValueError("YSF gateway port must be between 1024 and 65535.")
+        if not re.fullmatch(r"[0-9A-F]{1,3}", p25_nac):
+            raise ValueError("P25 NAC must be a valid hex code (e.g. 293).")
+        if not (0 <= nxdn_ran <= 63):
+            raise ValueError("NXDN RAN must be between 0 and 63.")
+
+    # AllStarLink fields
+    asl_node = _clean_line(asl.get("nodeNumber", "20804")) or "20804"
+    asl_pass = _clean_line(asl.get("nodePassword", ""))
+    asl_call = _clean_line(asl.get("callsign", callsign)).upper() or callsign
+    asl_iax = int(asl.get("iaxPort", 4569))
+    asl_reg = _clean_line(asl.get("registrationServer", "register.allstarlink.org")) or "register.allstarlink.org"
+    asl_iface = _clean_line(asl.get("radioInterface", "simpleusb"))
+    if asl_iface not in ("simpleusb", "usbradio", "pseudo"):
+        asl_iface = "simpleusb"
+    asl_duplex = str(asl.get("duplexMode", "1")).strip()
+    if asl_duplex not in ("0", "1", "2"):
+        asl_duplex = "1"
+    asl_carrier = _clean_line(asl.get("carrierFrom", "usbinvert"))
+    if asl_carrier not in ("usbinvert", "usb", "vox", "no"):
+        asl_carrier = "usbinvert"
+    asl_ctcss = _clean_line(asl.get("ctcssFrom", "no"))
+    if asl_ctcss not in ("no", "usb", "usbinvert"):
+        asl_ctcss = "no"
+    asl_txmix = _clean_line(asl.get("txMixA", "voice"))
+    if asl_txmix not in ("voice", "composite", "no"):
+        asl_txmix = "voice"
+    asl_ami_user = _clean_line(asl.get("amiUser", "admin")) or "admin"
+    asl_ami_secret = _clean_line(asl.get("amiSecret", ""))
+
+    extra_nodes_clean: list[dict] = []
+    seen_nodes = {asl_node}
+    for raw_extra in asl.get("additionalNodes") or []:
+        if not isinstance(raw_extra, dict):
+            continue
+        en = _clean_line(raw_extra.get("nodeNumber", ""))
+        ep = _clean_line(raw_extra.get("nodePassword", ""))
+        ei = _clean_line(raw_extra.get("radioInterface", "pseudo"))
+        if ei not in ("simpleusb", "usbradio", "pseudo"):
+            ei = "pseudo"
+        ed = str(raw_extra.get("duplexMode", "1")).strip()
+        if ed not in ("0", "1", "2"):
+            ed = "1"
+        if asl_enabled:
+            if not re.fullmatch(r"\d{4,6}", en):
+                raise ValueError(f"Additional AllStarLink node '{en}' must be 4–6 digits.")
+            if en in seen_nodes:
+                raise ValueError(f"Duplicate AllStarLink node number: {en}.")
+        seen_nodes.add(en)
+        extra_nodes_clean.append(
+            {
+                "id": _clean_line(raw_extra.get("id", f"node-{en}"))[:48] or f"node-{en}",
+                "nodeNumber": en,
+                "nodePassword": ep,
+                "radioInterface": ei,
+                "duplexMode": ed,
+            }
+        )
+
+    if asl_enabled:
+        if not re.fullmatch(r"\d{4,6}", asl_node):
+            raise ValueError("Primary AllStarLink node number must be 4–6 digits.")
+        if not re.fullmatch(r"[A-Z0-9]{3,10}", asl_call):
+            raise ValueError("AllStarLink callsign must be 3–10 alphanumeric characters.")
+        if not (1024 <= asl_iax <= 65535):
+            raise ValueError("AllStarLink IAX2 port must be between 1024 and 65535.")
+        if not re.fullmatch(r"[a-zA-Z0-9.-]+", asl_reg):
+            raise ValueError("Invalid AllStarLink registration server hostname.")
+        if not re.fullmatch(r"[a-zA-Z0-9._-]{2,32}", asl_ami_user):
+            raise ValueError("Invalid AMI username.")
+
+    # DVSwitch fields
+    dvs_bridge_node = _clean_line(dvs.get("bridgeNodeNumber", "1999"))
+    dvs_usrp_host = _clean_line(dvs.get("usrpHost", "127.0.0.1")) or "127.0.0.1"
+    dvs_usrp_tx = int(dvs.get("usrpTxPort", 34001))
+    dvs_usrp_rx = int(dvs.get("usrpRxPort", 32001))
+    dvs_mode = _clean_line(dvs.get("defaultMode", "DMR")).upper()
+    if dvs_mode not in ("DMR", "YSF", "DSTAR", "P25", "NXDN"):
+        dvs_mode = "DMR"
+    dvs_dmr_id = _clean_line(dvs.get("dmrId", dmr_id)) or dmr_id
+    dvs_rep_id = _clean_line(dvs.get("repeaterId", f"{dvs_dmr_id}99")) or f"{dvs_dmr_id}99"
+    dvs_tg = _clean_line(dvs.get("defaultTalkgroup", "3100")) or "3100"
+    dvs_host = _clean_line(dvs.get("dmrMasterHost", dmr_host)) or "3102.repeater.net"
+    dvs_port = int(dvs.get("dmrMasterPort", 62031))
+    dvs_pass = _clean_line(dvs.get("dmrMasterPassword", ""))
+    dvs_ambe = _clean_line(dvs.get("ambeMode", "md380-emu"))
+    if dvs_ambe not in ("md380-emu", "thumbdv"):
+        dvs_ambe = "md380-emu"
+    dvs_tlv_tx = int(dvs.get("tlvTxPort", 31103))
+    dvs_tlv_rx = int(dvs.get("tlvRxPort", 31100))
+    dvs_usrp_gain = max(0.05, min(5.0, float(dvs.get("usrpGain", 0.35))))
+    dvs_tlv_gain = max(0.05, min(5.0, float(dvs.get("tlvGain", 0.35))))
+
+    if dvs_enabled:
+        if dvs_bridge_node and not re.fullmatch(r"\d{4,6}", dvs_bridge_node):
+            raise ValueError("DVSwitch private USRP bridge node must be 4–6 digits or blank.")
+        if not re.fullmatch(r"[a-zA-Z0-9.-]+", dvs_usrp_host):
+            raise ValueError("Invalid DVSwitch USRP host.")
+        for p_val in (dvs_usrp_tx, dvs_usrp_rx, dvs_tlv_tx, dvs_tlv_rx, dvs_port):
+            if not (1024 <= p_val <= 65535):
+                raise ValueError("DVSwitch UDP ports must be between 1024 and 65535.")
+        if not re.fullmatch(r"\d{6,7}", dvs_dmr_id):
+            raise ValueError("DVSwitch DMR ID must be 6–7 digits.")
+        if not re.fullmatch(r"\d{7,9}", dvs_rep_id):
+            raise ValueError("DVSwitch Repeater ID must be 7–9 digits.")
+        if not re.fullmatch(r"\d{1,8}", dvs_tg):
+            raise ValueError("DVSwitch default talkgroup must be numeric.")
+        if not re.fullmatch(r"[a-zA-Z0-9.-]+", dvs_host):
+            raise ValueError("Invalid DVSwitch DMR master host.")
+
+    hostname = _clean_line(sy.get("hostname", "mmdvm-asl-node"))
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9-]{0,62}", hostname):
         raise ValueError("Hostname may only contain letters, digits, and hyphens.")
-
     timezone_str = _clean_line(sy.get("timezone", "UTC")) or "UTC"
     if not re.fullmatch(r"[A-Za-z0-9_/+:-]+", timezone_str):
         raise ValueError("Invalid timezone string.")
-
     webgui_port = int(sy.get("webguiPort", 8080))
     ssh_port = int(sy.get("sshPort", 22))
     if not (1024 <= webgui_port <= 65535) or not (1 <= ssh_port <= 65535):
@@ -381,7 +488,7 @@ def _validate_config(cfg: dict) -> dict:
     return {
         "station": {
             "callsign": callsign,
-            "dmrId": dmr_id or "3100000",
+            "dmrId": dmr_id,
             "essidSuffix": essid,
             "duplex": bool(st.get("duplex", False)),
             "rxFrequencyMhz": rx_mhz,
@@ -401,6 +508,7 @@ def _validate_config(cfg: dict) -> dict:
             "url": _clean_line(st.get("url", "https://www.qrz.com"))[:96] or "https://www.qrz.com",
         },
         "modem": {
+            "enabled": mmdvm_enabled,
             "modemModel": _clean_line(md.get("modemModel", "custom"))[:64],
             "protocol": protocol,
             "uartPort": uart_port,
@@ -432,6 +540,47 @@ def _validate_config(cfg: dict) -> dict:
             "p25Nac": p25_nac,
             "nxdnEnable": nxdn_enable,
             "nxdnRan": nxdn_ran,
+        },
+        "allstar": {
+            "enabled": asl_enabled,
+            "nodeNumber": asl_node,
+            "nodePassword": asl_pass,
+            "callsign": asl_call,
+            "iaxPort": asl_iax,
+            "registrationServer": asl_reg,
+            "radioInterface": asl_iface,
+            "duplexMode": asl_duplex,
+            "additionalNodes": extra_nodes_clean,
+            "carrierFrom": asl_carrier,
+            "ctcssFrom": asl_ctcss,
+            "rxBoost": bool(asl.get("rxBoost", False)),
+            "pttInvert": bool(asl.get("pttInvert", False)),
+            "plFilter": bool(asl.get("plFilter", True)),
+            "deEmphasis": bool(asl.get("deEmphasis", False)),
+            "preEmphasis": bool(asl.get("preEmphasis", False)),
+            "txMixA": asl_txmix,
+            "amiUser": asl_ami_user,
+            "amiSecret": asl_ami_secret,
+            "installAllmon3": bool(asl.get("installAllmon3", False)),
+        },
+        "dvswitch": {
+            "enabled": dvs_enabled,
+            "bridgeNodeNumber": dvs_bridge_node,
+            "usrpHost": dvs_usrp_host,
+            "usrpTxPort": dvs_usrp_tx,
+            "usrpRxPort": dvs_usrp_rx,
+            "defaultMode": dvs_mode,
+            "dmrId": dvs_dmr_id,
+            "repeaterId": dvs_rep_id,
+            "defaultTalkgroup": dvs_tg,
+            "dmrMasterHost": dvs_host,
+            "dmrMasterPort": dvs_port,
+            "dmrMasterPassword": dvs_pass,
+            "ambeMode": dvs_ambe,
+            "tlvTxPort": dvs_tlv_tx,
+            "tlvRxPort": dvs_tlv_rx,
+            "usrpGain": round(dvs_usrp_gain, 2),
+            "tlvGain": round(dvs_tlv_gain, 2),
         },
         "system": {
             "hostname": hostname,
@@ -472,6 +621,320 @@ def _load_saved_config() -> dict | None:
         return None
 
 
+def _rxchannel_for(iface: str, stanza: str) -> str:
+    if iface == "simpleusb":
+        return f"SimpleUSB/{stanza}"
+    if iface == "usbradio":
+        return f"Radio/{stanza}"
+    return "dahdi/pseudo"
+
+
+def _write_asterisk_files(cfg: dict, backup_existing: bool = True) -> None:
+    a = cfg["allstar"]
+    node = a["nodeNumber"]
+    callsign = a["callsign"]
+    extra_nodes = a.get("additionalNodes") or []
+    yn = lambda v: "yes" if v else "no"
+
+    os.makedirs("/etc/asterisk", exist_ok=True)
+    if backup_existing and os.path.isfile("/etc/asterisk/rpt.conf"):
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        bdir = f"/etc/asterisk/backup.{ts}"
+        os.makedirs(bdir, exist_ok=True)
+        for fname in ("rpt.conf", "iax.conf", "extensions.conf", "simpleusb.conf", "manager.conf"):
+            src = os.path.join("/etc/asterisk", fname)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(bdir, fname))
+        _append_log(f"[INFO] Backed up existing Asterisk configs to {bdir}")
+
+    extra_stanzas = ""
+    extra_nodes_tbl = ""
+    extra_regs = ""
+    extra_ext = ""
+    extra_usb = ""
+    any_simpleusb = a["radioInterface"] == "simpleusb"
+
+    for extra in extra_nodes:
+        en = extra["nodeNumber"]
+        ch = _rxchannel_for(extra["radioInterface"], f"usb_{en}")
+        extra_stanzas += f"""
+[{en}](node-main)
+rxchannel = {ch}
+duplex = {extra['duplexMode']}
+idrecording = |i{callsign}
+statpost_program = /usr/bin/wget,-q,--timeout=15,--tries=1,--output-document=/dev/null
+statpost_url = http://stats.allstarlink.org/uhandler
+"""
+        extra_nodes_tbl += f"{en} = radio@127.0.0.1:{a['iaxPort']}/{en},NONE\n"
+        if extra.get("nodePassword"):
+            extra_regs += f"\nregister => {en}:{extra['nodePassword']}@{a['registrationServer']}"
+        extra_ext += f"exten => {en},1,rpt({en})\n"
+        if extra["radioInterface"] == "simpleusb":
+            any_simpleusb = True
+            extra_usb += f"""
+[usb_{en}]
+eeprom = 0
+hdwtype = 0
+rxboost = {yn(a['rxBoost'])}
+carrierfrom = {a['carrierFrom']}
+ctcssfrom = {a['ctcssFrom']}
+invertptt = {yn(a['pttInvert'])}
+plfilter = {yn(a['plFilter'])}
+deemphasis = {yn(a['deEmphasis'])}
+preemphasis = {yn(a['preEmphasis'])}
+txmixa = {a['txMixA']}
+txmixb = no
+rxondelay = 0
+txoffdelay = 0
+"""
+
+    dvs = cfg.get("dvswitch") or {}
+    dvs_node = dvs.get("bridgeNodeNumber", "").strip() if dvs.get("enabled") else ""
+    existing_asl_ids = {node} | {e["nodeNumber"] for e in extra_nodes}
+    if dvs_node and re.fullmatch(r"\d{4,6}", dvs_node) and dvs_node not in existing_asl_ids:
+        extra_stanzas += f"""
+; Private USRP bridge node for DVSwitch Analog_Bridge
+[{dvs_node}](node-main)
+rxchannel = USRP/{dvs['usrpHost']}:{dvs['usrpTxPort']}:{dvs['usrpRxPort']}
+duplex = 0
+idrecording = |i{callsign}
+"""
+        extra_nodes_tbl += f"{dvs_node} = radio@127.0.0.1:{a['iaxPort']}/{dvs_node},NONE\n"
+        extra_ext += f"exten => {dvs_node},1,rpt({dvs_node})\n"
+
+    rpt_conf = f"""; /etc/asterisk/rpt.conf — Generated by Node Control WebGUI
+[node-main](!)
+context = radio
+callerid = "Repeater" <0000000000>
+accountcode = RADIO
+hangtime = 100
+althangtime = 100
+totime = 170000
+idtime = 540000
+politeid = 30000
+idtalkover = |i{callsign}
+unlinkedct = ct2
+remotect = ct3
+linkunkeyct = ct8
+nolocallinkct = 0
+eannmode = 1
+telemdefault = 2
+telemdynamic = 1
+linktolink = no
+nounkeyct = 0
+holdofftelem = 1
+telemnomdb = 0
+telemduckdb = -9
+functions = functions
+phone_functions = functions
+link_functions = functions
+telemetry = telemetry
+morse = morse
+wait_times = wait-times
+
+[{node}](node-main)
+rxchannel = {_rxchannel_for(a['radioInterface'], 'usb')}
+duplex = {a['duplexMode']}
+idrecording = |i{callsign}
+statpost_program = /usr/bin/wget,-q,--timeout=15,--tries=1,--output-document=/dev/null
+statpost_url = http://stats.allstarlink.org/uhandler
+{extra_stanzas}
+[functions]
+1 = ilink,1
+2 = ilink,2
+3 = ilink,3
+4 = ilink,4
+5 = macro,1
+70 = ilink,5
+71 = ilink,6
+72 = ilink,7
+73 = ilink,15
+75 = ilink,8
+76 = ilink,6
+80 = status,11
+81 = status,12
+
+[telemetry]
+ct1 = |t(350,0,100,2048)(500,0,100,2048)(660,0,100,2048)
+ct2 = |t(660,880,150,2048)
+ct3 = |t(440,0,150,2048)
+ct8 = |t(700,0,50,2048)
+remotetx = |t(1633,0,50,3000)(0,0,80,0)(1209,0,50,3000)
+remotemon = |t(1209,0,50,2048)
+cmdmode = |t(900,903,200,2048)
+functcomplete = |t(1000,0,100,2048)(0,0,100,0)(1000,0,100,2048)
+
+[morse]
+speed = 20
+frequency = 800
+amplitude = 4096
+idfrequency = 750
+idamplitude = 1024
+
+[wait-times]
+telemwait = 2000
+idwait = 500
+unkeywait = {'200' if a['duplexMode'] == '0' else '1000'}
+calltermwait = 2000
+
+[nodes]
+{node} = radio@127.0.0.1:{a['iaxPort']}/{node},NONE
+{extra_nodes_tbl}
+[memory]
+
+[macro]
+1 = *71#
+"""
+
+    iax_conf = f"""; /etc/asterisk/iax.conf — Generated by MMDVM & AllStarLink WebGUI
+[general]
+bindport = {a['iaxPort']}
+bindaddr = 0.0.0.0
+disallow = all
+allow = ulaw
+allow = adpcm
+allow = g726aal2
+allow = gsm
+jitterbuffer = yes
+forcejitterbuffer = yes
+dropcount = 2
+maxjitterbuffer = 4000
+maxjitterinterps = 10
+resyncthreshold = 1000
+maxexcessbuffer = 80
+minexcessbuffer = 10
+jittershrinkrate = 1
+tos = ef
+autokill = yes
+delayreject = yes
+
+register => {node}:{a['nodePassword']}@{a['registrationServer']}{extra_regs}
+
+[radio-proxy]
+type = user
+deny = 0.0.0.0/0.0.0.0
+permit = 127.0.0.1/255.255.255.0
+context = radio-secure
+disallow = all
+allow = ulaw
+allow = g726aal2
+allow = gsm
+transfer = no
+
+[radio]
+type = user
+disallow = all
+allow = ulaw
+allow = adpcm
+allow = g726aal2
+allow = gsm
+codecpriority = host
+context = radio-secure
+transfer = no
+
+[allstar-public]
+type = user
+context = allstar-public
+auth = md5
+secret = allstar
+disallow = all
+allow = ulaw
+allow = gsm
+transfer = no
+"""
+
+    extensions_conf = f"""; /etc/asterisk/extensions.conf — Generated by MMDVM & AllStarLink WebGUI
+[general]
+static = yes
+writeprotect = yes
+
+[globals]
+HOMENPA = 999
+NODE = {node}
+
+[radio-secure]
+exten => {node},1,rpt({node})
+{extra_ext}exten => _X.,1,Wait(1)
+exten => _X.,n,Hangup
+
+[allstar-public]
+exten => s,1,Ringing
+exten => s,n,Wait(2)
+exten => s,n,Answer
+exten => s,n,Wait(1)
+exten => s,n,Playback(rpt/node)
+exten => s,n,SayDigits({node})
+exten => s,n,rpt({node}|P)
+
+[radio]
+exten => _X11,1,Goto(check_route,${{EXTEN}},1)
+exten => _NXXXXXX,1,Goto(check_route,${{EXTEN}},1)
+exten => _1NXXNXXXXXX,1,Goto(check_route,${{EXTEN}},1)
+"""
+
+    simpleusb_conf = f"""; /etc/asterisk/simpleusb.conf — Generated by MMDVM & AllStarLink WebGUI
+[general]
+
+[usb]
+eeprom = 0
+hdwtype = 0
+rxboost = {yn(a['rxBoost'])}
+carrierfrom = {a['carrierFrom']}
+ctcssfrom = {a['ctcssFrom']}
+invertptt = {yn(a['pttInvert'])}
+plfilter = {yn(a['plFilter'])}
+deemphasis = {yn(a['deEmphasis'])}
+preemphasis = {yn(a['preEmphasis'])}
+txmixa = {a['txMixA']}
+txmixb = no
+rxondelay = 0
+txoffdelay = 0
+{extra_usb}"""
+
+    manager_conf = f"""; /etc/asterisk/manager.conf — Generated by MMDVM & AllStarLink WebGUI
+[general]
+enabled = yes
+port = 5038
+bindaddr = 127.0.0.1
+
+[{a['amiUser']}]
+secret = {a['amiSecret']}
+read = all,system,call,log,verbose,command,agent,user,config
+write = all,system,call,log,verbose,command,agent,user,config
+deny = 0.0.0.0/0.0.0.0
+permit = 127.0.0.1/255.255.255.0
+"""
+
+    for fname, content in (
+        ("rpt.conf", rpt_conf),
+        ("iax.conf", iax_conf),
+        ("extensions.conf", extensions_conf),
+        ("simpleusb.conf", simpleusb_conf),
+        ("manager.conf", manager_conf),
+    ):
+        fpath = os.path.join("/etc/asterisk", fname)
+        with open(fpath, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        _append_log(f"[INFO] Wrote {fpath}")
+
+    modules_path = "/etc/asterisk/modules.conf"
+    if any_simpleusb and os.path.isfile(modules_path):
+        try:
+            mod_text = Path(modules_path).read_text(encoding="utf-8", errors="ignore")
+            if "chan_simpleusb.so" not in mod_text:
+                with open(modules_path, "a", encoding="utf-8") as fh:
+                    fh.write("\nload = chan_simpleusb.so\n")
+        except OSError:
+            pass
+
+    _run_cmd(["chown", "-R", "asterisk:asterisk", "/etc/asterisk"], check=False)
+    for secret_file in ("/etc/asterisk/iax.conf", "/etc/asterisk/manager.conf"):
+        try:
+            os.chmod(secret_file, 0o640)
+        except OSError:
+            pass
+
+
 def _ensure_mmdvm_user_and_dirs() -> None:
     os.makedirs("/etc/mmdvm", exist_ok=True)
     os.makedirs("/var/log/mmdvm", exist_ok=True)
@@ -498,9 +961,7 @@ def _write_mmdvm_files(cfg: dict, backup_existing: bool = True) -> None:
                 shutil.copy2(src, os.path.join(bdir, name))
         _append_log(f"[INFO] Backed up previous INI files to {bdir}")
 
-    mmdvm_ini = f"""; /etc/mmdvm/MMDVM.ini — Generated by MMDVM WebGUI Configurator
-; Compatible with upstream g4klx/MMDVMHost (MMDVM-Host)
-
+    mmdvm_ini = f"""; /etc/mmdvm/MMDVM.ini — Generated by MMDVM & AllStarLink WebGUI
 [General]
 Callsign={st['callsign']}
 Id={full_id}
@@ -511,7 +972,6 @@ NetModeHang=3
 Daemon=0
 
 [Log]
-; 0=No logging, 1=Debug, 2=Message, 3=Info, 4=Warning, 5=Error, 6=Fatal
 MQTTLevel=0
 DisplayLevel=1
 
@@ -669,7 +1129,7 @@ Enable=0
 """
 
     dmr_net_enabled = "1" if (nw["dmrEnable"] and nw["dmrMasterHost"]) else "0"
-    dmrgw_ini = f"""; /etc/mmdvm/DMRGateway.ini — Generated by MMDVM WebGUI Configurator
+    dmrgw_ini = f"""; /etc/mmdvm/DMRGateway.ini — Generated by MMDVM & AllStarLink WebGUI
 [General]
 Id={full_id}
 Timeout=10
@@ -819,9 +1279,228 @@ WantedBy=multi-user.target
     _append_log("[INFO] Wrote dmrgateway.service and mmdvmhost.service")
 
 
-def _log_service_health_snapshot() -> None:
+def _unit_exists(unit: str) -> bool:
+    try:
+        proc = subprocess.run(
+            ["systemctl", "list-unit-files", f"{unit}.service", "--no-legend"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        return bool(proc.stdout.strip())
+    except Exception:
+        return False
+
+
+def _write_dvswitch_files(cfg: dict, backup_existing: bool = True) -> None:
+    dvs = cfg["dvswitch"]
+    st = cfg["station"]
+    nw = cfg["networks"]
+    asl = cfg["allstar"]
+    callsign = (asl.get("callsign") or st.get("callsign") or "N0CALL").upper()
+    use_emu = dvs["ambeMode"] == "md380-emu"
+
+    os.makedirs("/opt/Analog_Bridge", exist_ok=True)
+    os.makedirs("/opt/MMDVM_Bridge", exist_ok=True)
+    os.makedirs("/var/log/mmdvm", exist_ok=True)
+
+    if backup_existing:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        for fpath in (
+            "/opt/Analog_Bridge/Analog_Bridge.ini",
+            "/opt/MMDVM_Bridge/DVSwitch.ini",
+            "/opt/MMDVM_Bridge/MMDVM_Bridge.ini",
+        ):
+            if os.path.isfile(fpath):
+                shutil.copy2(fpath, f"{fpath}.bak.{ts}")
+
+    dv3000_serial_block = (
+        "; serial = false"
+        if use_emu
+        else "serial = true\nbaud = 460800\ndevice = /dev/ttyUSB0"
+    )
+
+    ab_ini = f"""; /opt/Analog_Bridge/Analog_Bridge.ini — Generated by Node Control WebGUI
+[GENERAL]
+logLevel = 2
+exportMetadata = true
+subscriberFile = /var/lib/dvswitch/subscriber_ids.csv
+transferRootDir = /tmp
+
+[AMBE_AUDIO]
+address = 127.0.0.1
+txPort = {dvs['tlvTxPort']}
+rxPort = {dvs['tlvRxPort']}
+ambeMode = {dvs['defaultMode']}
+minTxTimeMS = 2500
+gatewayDmrId = {dvs['dmrId']}
+repeaterID = {dvs['repeaterId']}
+txTg = {dvs['defaultTalkgroup']}
+txTs = 2
+colorCode = {nw['dmrColorCode']}
+
+[USRP]
+address = {dvs['usrpHost']}
+txPort = {dvs['usrpRxPort']}
+rxPort = {dvs['usrpTxPort']}
+usrpAudio = AUDIO_USE_GAIN
+usrpGain = {dvs['usrpGain']:.2f}
+usrpAgc = -20,10,100
+tlvAudio = AUDIO_USE_GAIN
+tlvGain = {dvs['tlvGain']:.2f}
+aslAudio = AUDIO_USE_GAIN
+agcGain = -20,10,100
+dmrAudio = AUDIO_USE_GAIN
+dmrGain = {dvs['tlvGain']:.2f}
+
+[DV3000]
+address = 127.0.0.1
+rxPort = 2470
+useEmulator = {'true' if use_emu else 'false'}
+emulatorAddress = 127.0.0.1:2470
+{dv3000_serial_block}
+
+[MACROS]
+; Callsign={callsign}
+"""
+
+    dvs_ini = f"""; /opt/MMDVM_Bridge/DVSwitch.ini — Generated by Node Control WebGUI
+[DMR]
+address = 127.0.0.1
+txPort = {dvs['tlvRxPort']}
+rxPort = {dvs['tlvTxPort']}
+slot = 2
+
+[DSTAR]
+address = 127.0.0.1
+txPort = 32100
+rxPort = 32103
+
+[YSF]
+address = 127.0.0.1
+txPort = 35100
+rxPort = 35103
+fallbackID = {dvs['dmrId']}
+exportTG = {dvs['defaultTalkgroup']}
+
+[P25]
+address = 127.0.0.1
+txPort = 34100
+rxPort = 34103
+
+[NXDN]
+address = 127.0.0.1
+txPort = 33100
+rxPort = 33103
+"""
+
+    mb_ini = f"""; /opt/MMDVM_Bridge/MMDVM_Bridge.ini — Generated by Node Control WebGUI
+[General]
+Callsign={callsign}
+Id={dvs['repeaterId']}
+Timeout=180
+Duplex=0
+
+[Info]
+RXFrequency={st['_rxHz']}
+TXFrequency={st['_txHz']}
+Power=1
+Latitude={st['latitude']}
+Longitude={st['longitude']}
+Height={st['heightMeters']}
+Location={st['location']}
+Description={callsign} DVSwitch Bridge
+URL={st['url']}
+
+[Log]
+DisplayLevel=1
+FileLevel=1
+FilePath=/var/log/mmdvm
+FileRoot=MMDVM_Bridge
+
+[DMR Id Lookup]
+File=/var/lib/dvswitch/DMRIds.dat
+Time=24
+
+[DMR]
+Enable={'1' if dvs['defaultMode'] == 'DMR' else '0'}
+ColorCode={nw['dmrColorCode']}
+
+[DMR Network]
+Enable={'1' if dvs['defaultMode'] == 'DMR' else '0'}
+Type=Gateway
+Address={dvs['dmrMasterHost']}
+Port={dvs['dmrMasterPort']}
+Jitter=360
+Local=62032
+Password={dvs['dmrMasterPassword']}
+Slot1=0
+Slot2=1
+Debug=0
+
+[System Fusion]
+Enable={'1' if dvs['defaultMode'] == 'YSF' else '0'}
+
+[System Fusion Network]
+Enable={'1' if dvs['defaultMode'] == 'YSF' else '0'}
+LocalAddress=127.0.0.1
+LocalPort=3200
+GatewayAddress=127.0.0.1
+GatewayPort=4200
+Debug=0
+
+[D-Star]
+Enable={'1' if dvs['defaultMode'] == 'DSTAR' else '0'}
+Module={nw['dstarModule']}
+
+[D-Star Network]
+Enable={'1' if dvs['defaultMode'] == 'DSTAR' else '0'}
+GatewayAddress=127.0.0.1
+GatewayPort=20010
+LocalPort=20011
+Debug=0
+
+[P25]
+Enable={'1' if dvs['defaultMode'] == 'P25' else '0'}
+NAC={nw['p25Nac']}
+
+[P25 Network]
+Enable={'1' if dvs['defaultMode'] == 'P25' else '0'}
+GatewayAddress=127.0.0.1
+GatewayPort=42020
+LocalPort=32010
+Debug=0
+
+[NXDN]
+Enable={'1' if dvs['defaultMode'] == 'NXDN' else '0'}
+RAN={nw['nxdnRan']}
+
+[NXDN Network]
+Enable={'1' if dvs['defaultMode'] == 'NXDN' else '0'}
+GatewayAddress=127.0.0.1
+GatewayPort=14020
+LocalPort=14021
+Debug=0
+"""
+
+    for fpath, content in (
+        ("/opt/Analog_Bridge/Analog_Bridge.ini", ab_ini),
+        ("/opt/MMDVM_Bridge/DVSwitch.ini", dvs_ini),
+        ("/opt/MMDVM_Bridge/MMDVM_Bridge.ini", mb_ini),
+    ):
+        with open(fpath, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        _append_log(f"[INFO] Wrote {fpath}")
+
+    try:
+        os.chmod("/opt/MMDVM_Bridge/MMDVM_Bridge.ini", 0o640)
+    except OSError:
+        pass
+
+
+def _log_service_health_snapshot(units: list[str]) -> None:
     time.sleep(2)
-    for unit in ("dmrgateway", "mmdvmhost"):
+    for unit in units:
         st = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True).stdout.strip() or "inactive"
         _append_log(f"[STATUS] {unit}.service -> {st}")
         if st != "active":
@@ -838,14 +1517,17 @@ def _log_service_health_snapshot() -> None:
 def _run_install_worker(cfg: dict) -> None:
     md = cfg["modem"]
     nw = cfg["networks"]
+    asl = cfg["allstar"]
+    dvs = cfg["dvswitch"]
     sy = cfg["system"]
     env = dict(os.environ)
     env["DEBIAN_FRONTEND"] = "noninteractive"
     nproc = str(os.cpu_count() or 2)
+    codename = _detect_codename()
 
     try:
-        # 1. System Dependencies & MMDVM User
-        _set_step(1, "Install Build Dependencies, Configure Host & MMDVM User")
+        # 1. System Dependencies & Host Settings
+        _set_step(1, "Install System Dependencies & Configure Host")
         _save_config(cfg)
         _run_cmd(["hostnamectl", "set-hostname", sy["hostname"]], check=False)
         _run_cmd(["timedatectl", "set-timezone", sy["timezone"]], check=False)
@@ -858,7 +1540,10 @@ def _run_install_worker(cfg: dict) -> None:
                 "--no-install-recommends",
                 "git",
                 "curl",
+                "wget",
                 "ca-certificates",
+                "gnupg2",
+                "lsb-release",
                 "build-essential",
                 "g++",
                 "make",
@@ -868,59 +1553,129 @@ def _run_install_worker(cfg: dict) -> None:
             ],
             env=env,
         )
-        _ensure_mmdvm_user_and_dirs()
-        if md["configurePiUart"] and shutil.which("raspi-config"):
-            _append_log("[INFO] Configuring Raspberry Pi hardware UART via raspi-config...")
-            _run_cmd(["raspi-config", "nonint", "do_serial_hw", "0"], check=False)
-            _run_cmd(["raspi-config", "nonint", "do_serial_cons", "1"], check=False)
 
-        # 2. Build & Install MMDVMHost
-        _set_step(2, "Clone, Compile & Install g4klx/MMDVMHost")
-        host_src = "/usr/local/src/MMDVMHost"
-        if os.path.isdir(host_src):
-            shutil.rmtree(host_src)
-        _run_cmd(["git", "clone", "--depth", "1", "https://github.com/g4klx/MMDVMHost.git", host_src])
-        _run_cmd(["make", "-C", host_src, f"-j{nproc}"])
-        built_bin = f"{host_src}/MMDVM-Host" if os.path.isfile(f"{host_src}/MMDVM-Host") else f"{host_src}/MMDVMHost"
-        _run_cmd(["install", "-m", "0755", built_bin, "/usr/local/bin/MMDVMHost"])
+        # 2. AllStarLink 3 Installation & Asterisk Configs
+        if asl["enabled"]:
+            _set_step(2, f"Install AllStarLink 3 & Configure Node {asl['nodeNumber']}")
+            already_asl = subprocess.run(["dpkg", "-s", "asl3"], capture_output=True).returncode == 0
+            if not already_asl:
+                asl_deb = "asl-apt-repos.deb13_all.deb" if codename == "trixie" else "asl-apt-repos.deb12_all.deb"
+                _run_cmd(["curl", "-fsSL", f"https://repo.allstarlink.org/public/{asl_deb}", "-o", "/tmp/asl-apt-repos.deb"])
+                if _run_cmd(["dpkg", "-i", "/tmp/asl-apt-repos.deb"], check=False, env=env) != 0:
+                    _run_cmd(["apt-get", "install", "-f", "-y"], env=env)
+                try:
+                    os.remove("/tmp/asl-apt-repos.deb")
+                except OSError:
+                    pass
+                _run_cmd(["apt-get", "update", "-y"], env=env)
+                _run_cmd(["apt-get", "install", "-y", "asl3", "asl3-asterisk", "asl3-menu"], env=env)
+            else:
+                _append_log("[INFO] AllStarLink 3 (asl3) packages already installed; writing updated configs.")
+            if asl["installAllmon3"]:
+                _run_cmd(["apt-get", "install", "-y", "allmon3"], check=False, env=env)
+            _write_asterisk_files(cfg, backup_existing=True)
+            _run_cmd(["systemctl", "enable", "--now", "asterisk.service"], check=False)
+            _run_cmd(["systemctl", "restart", "asterisk.service"], check=False)
+        else:
+            _set_step(2, "AllStarLink 3 (Skipped — Disabled)")
 
-        # 3. Build & Install DMRGateway
-        _set_step(3, "Clone, Compile & Install g4klx/DMRGateway")
-        gw_src = "/usr/local/src/DMRGateway"
-        if os.path.isdir(gw_src):
-            shutil.rmtree(gw_src)
-        _run_cmd(["git", "clone", "--depth", "1", "https://github.com/g4klx/DMRGateway.git", gw_src])
-        _run_cmd(["make", "-C", gw_src, f"-j{nproc}"])
-        _run_cmd(["install", "-m", "0755", f"{gw_src}/DMRGateway", "/usr/local/bin/DMRGateway"])
+        # 3. DVSwitch Installation & Bridge Configs
+        if dvs["enabled"]:
+            _set_step(3, "Install DVSwitch (Analog_Bridge, MMDVM_Bridge, md380-emu)")
+            if not os.path.isfile("/opt/Analog_Bridge/Analog_Bridge"):
+                _run_cmd(["curl", "-fsSL", "http://dvswitch.org/bookworm", "-o", "/tmp/dvswitch-repo.sh"], check=False)
+                if os.path.isfile("/tmp/dvswitch-repo.sh"):
+                    os.chmod("/tmp/dvswitch-repo.sh", 0o755)
+                    _run_cmd(["/tmp/dvswitch-repo.sh"], check=False, env=env)
+                    try:
+                        os.remove("/tmp/dvswitch-repo.sh")
+                    except OSError:
+                        pass
+                _run_cmd(["apt-get", "update", "-y"], check=False, env=env)
+                if _run_cmd(["apt-get", "install", "-y", "dvswitch-server"], check=False, env=env) != 0:
+                    _run_cmd(["apt-get", "install", "-y", "analog-bridge", "mmdvm-bridge", "md380-emu"], check=False, env=env)
+            else:
+                _append_log("[INFO] DVSwitch binaries already installed; writing updated bridge configs.")
+            _write_dvswitch_files(cfg, backup_existing=True)
+        else:
+            _set_step(3, "DVSwitch Bridge (Skipped — Disabled)")
 
-        # 4. Write Config Files, Lookup Data, Firewall & Start Services
-        _set_step(4, "Write Configs, Download DMR IDs & Start Services")
-        _run_cmd(["curl", "-fsSL", "https://radioid.net/static/user.csv", "-o", "/etc/mmdvm/DMRIds.dat"], check=False)
-        _write_mmdvm_files(cfg, backup_existing=True)
+        # 4 & 5. MMDVMHost & DMRGateway Compilation
+        if md["enabled"]:
+            _set_step(4, "Clone, Compile & Install g4klx/MMDVMHost")
+            _ensure_mmdvm_user_and_dirs()
+            if md["configurePiUart"] and shutil.which("raspi-config"):
+                _append_log("[INFO] Configuring Raspberry Pi hardware UART via raspi-config...")
+                _run_cmd(["raspi-config", "nonint", "do_serial_hw", "0"], check=False)
+                _run_cmd(["raspi-config", "nonint", "do_serial_cons", "1"], check=False)
+
+            host_src = "/usr/local/src/MMDVMHost"
+            if os.path.isdir(host_src):
+                shutil.rmtree(host_src)
+            _run_cmd(["git", "clone", "--depth", "1", "https://github.com/g4klx/MMDVMHost.git", host_src])
+            _run_cmd(["make", "-C", host_src, f"-j{nproc}"])
+            built_bin = f"{host_src}/MMDVM-Host" if os.path.isfile(f"{host_src}/MMDVM-Host") else f"{host_src}/MMDVMHost"
+            _run_cmd(["install", "-m", "0755", built_bin, "/usr/local/bin/MMDVMHost"])
+
+            _set_step(5, "Clone, Compile & Install g4klx/DMRGateway")
+            gw_src = "/usr/local/src/DMRGateway"
+            if os.path.isdir(gw_src):
+                shutil.rmtree(gw_src)
+            _run_cmd(["git", "clone", "--depth", "1", "https://github.com/g4klx/DMRGateway.git", gw_src])
+            _run_cmd(["make", "-C", gw_src, f"-j{nproc}"])
+            _run_cmd(["install", "-m", "0755", f"{gw_src}/DMRGateway", "/usr/local/bin/DMRGateway"])
+        else:
+            _set_step(4, "MMDVMHost (Skipped — Disabled)")
+            _set_step(5, "DMRGateway (Skipped — Disabled)")
+
+        # 6. Write MMDVM Configs, Firewall & Verify Services
+        _set_step(6, "Finalize Configs, Firewall & Start Services")
+        if md["enabled"]:
+            _run_cmd(["curl", "-fsSL", "https://radioid.net/static/user.csv", "-o", "/etc/mmdvm/DMRIds.dat"], check=False)
+            _write_mmdvm_files(cfg, backup_existing=True)
 
         if sy["enableUfw"]:
             _run_cmd(["apt-get", "install", "-y", "ufw"], env=env, check=False)
             _run_cmd(["ufw", "default", "deny", "incoming"], check=False)
             _run_cmd(["ufw", "default", "allow", "outgoing"], check=False)
             _run_cmd(["ufw", "allow", f"{sy['sshPort']}/tcp", "comment", "SSH"], check=False)
-            _run_cmd(["ufw", "allow", f"{PORT}/tcp", "comment", "MMDVM WebGUI"], check=False)
-            if nw["dmrEnable"]:
+            _run_cmd(["ufw", "allow", f"{PORT}/tcp", "comment", "Node Control WebGUI"], check=False)
+            if asl["enabled"]:
+                _run_cmd(["ufw", "allow", f"{asl['iaxPort']}/udp", "comment", "AllStarLink IAX2"], check=False)
+                if asl["installAllmon3"]:
+                    _run_cmd(["ufw", "allow", "80/tcp", "comment", "Allmon3 HTTP"], check=False)
+                    _run_cmd(["ufw", "allow", "443/tcp", "comment", "Allmon3 HTTPS"], check=False)
+            if md["enabled"] and nw["dmrEnable"]:
                 _run_cmd(["ufw", "allow", f"{nw['dmrMasterPort']}/udp", "comment", "DMR Master"], check=False)
             _run_cmd(["ufw", "--force", "enable"], check=False)
 
-        _run_cmd(["systemctl", "daemon-reload"])
-        if nw["dmrEnable"]:
-            _run_cmd(["systemctl", "enable", "--now", "dmrgateway.service"], check=False)
-            _run_cmd(["systemctl", "restart", "dmrgateway.service"], check=False)
-        else:
-            _run_cmd(["systemctl", "disable", "--now", "dmrgateway.service"], check=False)
+        _run_cmd(["systemctl", "daemon-reload"], check=False)
+        watch_units: list[str] = []
+        if asl["enabled"]:
+            watch_units.append("asterisk")
+        if dvs["enabled"]:
+            for u in ("md380-emu", "analog_bridge", "mmdvm_bridge"):
+                if _unit_exists(u):
+                    _run_cmd(["systemctl", "enable", "--now", f"{u}.service"], check=False)
+                    _run_cmd(["systemctl", "restart", f"{u}.service"], check=False)
+                    watch_units.append(u)
+                else:
+                    _append_log(f"[WARN] {u}.service unit not found on host.")
+        if md["enabled"]:
+            if nw["dmrEnable"]:
+                _run_cmd(["systemctl", "enable", "--now", "dmrgateway.service"], check=False)
+                _run_cmd(["systemctl", "restart", "dmrgateway.service"], check=False)
+                watch_units.append("dmrgateway")
+            else:
+                _run_cmd(["systemctl", "disable", "--now", "dmrgateway.service"], check=False)
+            _run_cmd(["systemctl", "enable", "--now", "mmdvmhost.service"], check=False)
+            _run_cmd(["systemctl", "restart", "mmdvmhost.service"], check=False)
+            watch_units.append("mmdvmhost")
 
-        _run_cmd(["systemctl", "enable", "--now", "mmdvmhost.service"], check=False)
-        _run_cmd(["systemctl", "restart", "mmdvmhost.service"], check=False)
-        _log_service_health_snapshot()
+        _log_service_health_snapshot(watch_units)
 
         _append_log("========================================================================")
-        _append_log(f" MMDVM Installation Complete — {cfg['station']['callsign']}")
+        _append_log(" Installation Complete")
         _append_log("========================================================================")
 
         with job_lock:
@@ -937,9 +1692,11 @@ def _run_install_worker(cfg: dict) -> None:
 
 
 def _run_apply_config_worker(cfg: dict) -> None:
-    nw = cfg["networks"]
-    sy = cfg["system"]
     md = cfg["modem"]
+    nw = cfg["networks"]
+    asl = cfg["allstar"]
+    dvs = cfg["dvswitch"]
+    sy = cfg["system"]
 
     try:
         # 1. Save config & update host settings (NO apt/compile!)
@@ -947,35 +1704,73 @@ def _run_apply_config_worker(cfg: dict) -> None:
         _save_config(cfg)
         _run_cmd(["hostnamectl", "set-hostname", sy["hostname"]], check=False)
         _run_cmd(["timedatectl", "set-timezone", sy["timezone"]], check=False)
-        if md["protocol"] == "uart" and not os.path.exists(md["uartPort"]):
-            _append_log(
-                f"[WARN] Serial device {md['uartPort']} does not currently exist on this host. "
-                "MMDVMHost will fail to open the modem until the port exists or Null Modem is selected."
-            )
 
-        # 2. Write /etc/mmdvm/MMDVM.ini & /etc/mmdvm/DMRGateway.ini (no reinstall)
-        _set_step(2, "Write MMDVM.ini, DMRGateway.ini & Systemd Units")
-        _write_mmdvm_files(cfg, backup_existing=True)
+        # 2. Write AllStarLink, DVSwitch & MMDVM config files (no reinstall)
+        _set_step(2, "Write AllStarLink, DVSwitch & MMDVM Config Files")
+        if asl["enabled"]:
+            _write_asterisk_files(cfg, backup_existing=True)
+        else:
+            _append_log("[INFO] AllStarLink disabled in config; skipping /etc/asterisk write.")
 
-        # 3. Reload systemd & restart services
-        _set_step(3, "Reload & Restart MMDVM Services")
+        if dvs["enabled"]:
+            _write_dvswitch_files(cfg, backup_existing=True)
+        else:
+            _append_log("[INFO] DVSwitch disabled in config; skipping /opt/*_Bridge write.")
+
+        if md["enabled"]:
+            if md["protocol"] == "uart" and not os.path.exists(md["uartPort"]):
+                _append_log(
+                    f"[WARN] Serial device {md['uartPort']} does not currently exist on this host. "
+                    "Select a detected serial port or Null Modem in MMDVM Modem tab."
+                )
+            _write_mmdvm_files(cfg, backup_existing=True)
+        else:
+            _append_log("[INFO] MMDVMHost disabled in config; skipping /etc/mmdvm write.")
+
+        # 3. Reload systemd & restart enabled services
+        _set_step(3, "Reload & Restart Configured Services")
         _run_cmd(["systemctl", "daemon-reload"], check=False)
-        if nw["dmrEnable"]:
-            if os.path.isfile("/usr/local/bin/DMRGateway"):
-                _run_cmd(["systemctl", "enable", "--now", "dmrgateway.service"], check=False)
-                _run_cmd(["systemctl", "restart", "dmrgateway.service"], check=False)
+        watch_units: list[str] = []
+
+        if asl["enabled"]:
+            if shutil.which("asterisk"):
+                _run_cmd(["systemctl", "restart", "asterisk.service"], check=False)
+                watch_units.append("asterisk")
             else:
-                _append_log("[WARN] /usr/local/bin/DMRGateway is not installed yet — run the Installer tab once to compile binaries.")
-        else:
-            _run_cmd(["systemctl", "stop", "dmrgateway.service"], check=False)
+                _append_log("[WARN] Asterisk/AllStarLink 3 is not installed yet — run the Installer tab once to install asl3.")
 
-        if os.path.isfile("/usr/local/bin/MMDVMHost"):
-            _run_cmd(["systemctl", "enable", "--now", "mmdvmhost.service"], check=False)
-            _run_cmd(["systemctl", "restart", "mmdvmhost.service"], check=False)
-        else:
-            _append_log("[WARN] /usr/local/bin/MMDVMHost is not installed yet — run the Installer tab once to compile binaries.")
+        if dvs["enabled"]:
+            for u in ("md380-emu", "analog_bridge", "mmdvm_bridge"):
+                if _unit_exists(u):
+                    _run_cmd(["systemctl", "restart", f"{u}.service"], check=False)
+                    watch_units.append(u)
+                else:
+                    _append_log(f"[WARN] {u}.service is not installed yet — run the Installer tab once to install DVSwitch.")
 
-        _log_service_health_snapshot()
+        if md["enabled"]:
+            if nw["dmrEnable"]:
+                if os.path.isfile("/usr/local/bin/DMRGateway"):
+                    _run_cmd(["systemctl", "enable", "--now", "dmrgateway.service"], check=False)
+                    _run_cmd(["systemctl", "restart", "dmrgateway.service"], check=False)
+                    watch_units.append("dmrgateway")
+                else:
+                    _append_log("[WARN] /usr/local/bin/DMRGateway is not installed yet — run the Installer tab once.")
+            else:
+                _run_cmd(["systemctl", "stop", "dmrgateway.service"], check=False)
+
+            if os.path.isfile("/usr/local/bin/MMDVMHost"):
+                _run_cmd(["systemctl", "enable", "--now", "mmdvmhost.service"], check=False)
+                _run_cmd(["systemctl", "restart", "mmdvmhost.service"], check=False)
+                watch_units.append("mmdvmhost")
+            else:
+                _append_log("[WARN] /usr/local/bin/MMDVMHost is not installed yet — run the Installer tab once.")
+
+        _log_service_health_snapshot(watch_units)
+
+        if asl["enabled"] and shutil.which("asterisk"):
+            all_nodes = [asl["nodeNumber"]] + [n["nodeNumber"] for n in asl.get("additionalNodes") or []]
+            for n_id in all_nodes:
+                _run_cmd(["asterisk", "-rx", f"rpt nodes {n_id}"], check=False)
 
         _append_log("========================================================================")
         _append_log(" Config Files Applied & Services Reloaded (No Reinstall)")
@@ -1034,6 +1829,8 @@ def _read_host_metrics() -> tuple[int | None, float | None]:
 
 _dmr_id_cache: dict[str, str] = {}
 _dmr_id_mtime: float = 0.0
+_extnodes_cache: dict[str, str] = {}
+_extnodes_mtime: float = 0.0
 
 
 def _load_dmr_id_map() -> dict[str, str]:
@@ -1059,6 +1856,148 @@ def _load_dmr_id_map() -> dict[str, str]:
     except OSError:
         pass
     return _dmr_id_cache
+
+
+def _load_extnodes_map() -> dict[str, str]:
+    global _extnodes_cache, _extnodes_mtime
+    for candidate in ("/var/lib/asterisk/rpt_extnodes", "/tmp/rpt_extnodes"):
+        if os.path.isfile(candidate):
+            try:
+                mtime = os.path.getmtime(candidate)
+                if mtime == _extnodes_mtime and _extnodes_cache:
+                    return _extnodes_cache
+                mapping: dict[str, str] = {}
+                with open(candidate, "r", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        m = re.match(r"^\s*(\d{4,6})\s*=\s*[^;]*;\s*(.+)$", line)
+                        if m:
+                            mapping[m.group(1)] = m.group(2).strip()[:64]
+                _extnodes_cache = mapping
+                _extnodes_mtime = mtime
+                return _extnodes_cache
+            except OSError:
+                continue
+    return _extnodes_cache
+
+
+def _detect_rpt_nodes() -> list[str]:
+    rpt_path = "/etc/asterisk/rpt.conf"
+    found: list[str] = []
+    if os.path.isfile(rpt_path):
+        try:
+            with open(rpt_path, "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    m = re.match(r"^\s*\[(\d{4,6})\]", line)
+                    if m and m.group(1) not in found:
+                        found.append(m.group(1))
+        except OSError:
+            pass
+    if not found:
+        saved = _load_saved_config()
+        if saved and isinstance(saved.get("allstar"), dict):
+            primary = str(saved["allstar"].get("nodeNumber", "")).strip()
+            if re.fullmatch(r"\d{4,6}", primary):
+                found.append(primary)
+            for extra in saved["allstar"].get("additionalNodes") or []:
+                en = str((extra or {}).get("nodeNumber", "")).strip()
+                if re.fullmatch(r"\d{4,6}", en) and en not in found:
+                    found.append(en)
+    return found
+
+
+def _collect_allstar_live(asterisk_active: bool) -> dict:
+    local_nodes = _detect_rpt_nodes()
+    if not asterisk_active or not shutil.which("asterisk"):
+        return {
+            "active": False,
+            "nodes": [
+                {
+                    "node": n,
+                    "registered": "Offline",
+                    "connectedCount": 0,
+                    "connectedNodes": [],
+                }
+                for n in local_nodes
+            ],
+            "totalConnected": 0,
+        }
+
+    ext_map = _load_extnodes_map()
+    reg_map: dict[str, str] = {}
+    try:
+        reg_proc = subprocess.run(["asterisk", "-rx", "iax2 show registry"], capture_output=True, text=True, timeout=3)
+        for line in reg_proc.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and re.fullmatch(r"\d{4,6}", parts[2]):
+                reg_map[parts[2]] = " ".join(parts[5:]) if len(parts) >= 6 else parts[4]
+    except Exception:
+        pass
+
+    node_statuses: list[dict] = []
+    total_connected = 0
+    for node_id in local_nodes:
+        if not re.fullmatch(r"\d{4,6}", node_id):
+            continue
+        connected_by_id: dict[str, dict] = {}
+        try:
+            lstats = subprocess.run(["asterisk", "-rx", f"rpt lstats {node_id}"], capture_output=True, text=True, timeout=3)
+            for line in lstats.stdout.splitlines():
+                s = line.strip()
+                if not s or s.startswith("NODE") or s.startswith("----"):
+                    continue
+                parts = s.split()
+                if len(parts) >= 6 and re.fullmatch(r"\d{4,6}", parts[0]):
+                    rem = parts[0]
+                    mode_code = parts[3].upper()
+                    mode_label = "Transceive" if mode_code.startswith("T") else "Monitor" if mode_code.startswith("R") else "Connecting"
+                    connected_by_id[rem] = {
+                        "node": rem,
+                        "localNode": node_id,
+                        "description": ext_map.get(rem, ""),
+                        "mode": mode_label,
+                        "direction": parts[4],
+                        "elapsed": parts[5],
+                        "keyed": parts[2].upper() == "YES",
+                    }
+        except Exception:
+            pass
+
+        if not connected_by_id:
+            try:
+                nodes_proc = subprocess.run(["asterisk", "-rx", f"rpt nodes {node_id}"], capture_output=True, text=True, timeout=3)
+                for tok in re.findall(r"([TRC])(\d{4,6})", nodes_proc.stdout):
+                    flag, rem = tok[0], tok[1]
+                    if rem == node_id:
+                        continue
+                    mode_label = "Transceive" if flag == "T" else "Monitor" if flag == "R" else "Connecting"
+                    connected_by_id[rem] = {
+                        "node": rem,
+                        "localNode": node_id,
+                        "description": ext_map.get(rem, ""),
+                        "mode": mode_label,
+                        "direction": "—",
+                        "elapsed": "—",
+                        "keyed": False,
+                    }
+            except Exception:
+                pass
+
+        conn_list = list(connected_by_id.values())
+        total_connected += len(conn_list)
+        node_statuses.append(
+            {
+                "node": node_id,
+                "registered": reg_map.get(node_id, "Configured"),
+                "connectedCount": len(conn_list),
+                "connectedNodes": conn_list,
+            }
+        )
+
+    return {
+        "active": True,
+        "nodes": node_statuses,
+        "totalConnected": total_connected,
+    }
 
 
 def _resolve_callsign(raw: str, dmr_map: dict[str, str]) -> tuple[str, str]:
@@ -1290,11 +2229,14 @@ def _collect_live_telemetry() -> dict:
         "cpuTempC": cpu_temp_c,
         "detectedSerialPorts": _detect_serial_ports(),
         "installed": {
+            "asterisk": bool(shutil.which("asterisk")),
+            "dvswitch": os.path.isfile("/opt/Analog_Bridge/Analog_Bridge") or os.path.isfile("/opt/MMDVM_Bridge/MMDVM_Bridge"),
             "mmdvmhost": os.path.isfile("/usr/local/bin/MMDVMHost"),
             "dmrgateway": os.path.isfile("/usr/local/bin/DMRGateway"),
-            "configWritten": os.path.isfile("/etc/mmdvm/MMDVM.ini"),
+            "configWritten": os.path.isfile("/etc/mmdvm/MMDVM.ini") or os.path.isfile("/etc/asterisk/rpt.conf") or os.path.isfile("/opt/Analog_Bridge/Analog_Bridge.ini"),
         },
         "services": services,
+        "allstar": _collect_allstar_live(services.get("asterisk") == "active"),
         "dmrMasterConnected": dmr_logged_in and services.get("dmrgateway") == "active",
         "mmdvmhostLastError": host_last_err,
         "dmrgatewayLastError": gw_last_err,
@@ -1390,9 +2332,11 @@ class WebGuiHandler(http.server.SimpleHTTPRequestHandler):
                     "isRoot": os.geteuid() == 0,
                     "detectedSerialPorts": _detect_serial_ports(),
                     "installed": {
+                        "asterisk": bool(shutil.which("asterisk")),
+                        "dvswitch": os.path.isfile("/opt/Analog_Bridge/Analog_Bridge") or os.path.isfile("/opt/MMDVM_Bridge/MMDVM_Bridge"),
                         "mmdvmhost": os.path.isfile("/usr/local/bin/MMDVMHost"),
                         "dmrgateway": os.path.isfile("/usr/local/bin/DMRGateway"),
-                        "configWritten": os.path.isfile("/etc/mmdvm/MMDVM.ini"),
+                        "configWritten": os.path.isfile("/etc/mmdvm/MMDVM.ini") or os.path.isfile("/etc/asterisk/rpt.conf") or os.path.isfile("/opt/Analog_Bridge/Analog_Bridge.ini"),
                     },
                     "services": _get_service_states(),
                     "savedConfig": _load_saved_config(),
@@ -1536,7 +2480,7 @@ class WebGuiHandler(http.server.SimpleHTTPRequestHandler):
             if not tok:
                 return
             if os.geteuid() != 0:
-                self._send_json(403, {"error": "Server must run as root to write /etc/mmdvm files and manage services."})
+                self._send_json(403, {"error": "Server must run as root to write system config files and manage services."})
                 return
             try:
                 body = self._read_json_body()
@@ -1554,15 +2498,15 @@ class WebGuiHandler(http.server.SimpleHTTPRequestHandler):
                     {
                         "mode": "install" if is_install else "apply",
                         "status": "running",
-                        "step": "Starting MMDVM installer..." if is_install else "Applying configuration files...",
+                        "step": "Starting installation..." if is_install else "Applying configuration files...",
                         "stepIndex": 0,
-                        "totalSteps": 4 if is_install else 3,
+                        "totalSteps": 6 if is_install else 3,
                         "startedAt": _now_iso(),
                         "finishedAt": None,
                         "exitCode": None,
                         "error": None,
                         "logs": [
-                            f"[{_now_iso()}] {'Starting full MMDVMHost + DMRGateway install' if is_install else 'Applying edited MMDVM configuration (no reinstall)'} on {socket.gethostname()}..."
+                            f"[{_now_iso()}] {'Starting full AllStarLink + DVSwitch + MMDVM install' if is_install else 'Applying edited config files (no reinstall)'} on {socket.gethostname()}..."
                         ],
                     }
                 )
@@ -1589,17 +2533,48 @@ class WebGuiHandler(http.server.SimpleHTTPRequestHandler):
             if unit not in ALLOWED_SERVICES or action not in ALLOWED_ACTIONS:
                 self._send_json(400, {"error": "Invalid service unit or action."})
                 return
-            proc = subprocess.run(
-                ["systemctl", action, f"{unit}.service"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
+            proc = subprocess.run(["systemctl", action, f"{unit}.service"], capture_output=True, text=True, timeout=15)
             state = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True, timeout=3).stdout.strip() or "inactive"
             if proc.returncode != 0:
                 self._send_json(500, {"error": (proc.stderr or proc.stdout).strip() or f"Failed to {action} {unit}.", "state": state})
                 return
             self._send_json(200, {"ok": True, "unit": unit, "action": action, "state": state})
+            return
+
+        if path == "/api/asl/command":
+            tok, _ = self._require_auth()
+            if not tok:
+                return
+            if os.geteuid() != 0:
+                self._send_json(403, {"error": "Server must run as root to issue Asterisk commands."})
+                return
+            try:
+                body = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            local_node = _clean_line(body.get("localNode", ""))
+            action = _clean_line(body.get("action", ""))
+            target_node = _clean_line(body.get("targetNode", ""))
+            if not re.fullmatch(r"\d{4,6}", local_node):
+                self._send_json(400, {"error": "Local node must be 4–6 digits."})
+                return
+            if action not in ALLOWED_ASL_ACTIONS:
+                self._send_json(400, {"error": "Invalid AllStarLink command action."})
+                return
+            if action == "disconnect_all":
+                cmd = f"rpt cmd {local_node} ilink 6"
+            else:
+                if not re.fullmatch(r"\d{4,6}", target_node):
+                    self._send_json(400, {"error": "Target node must be 4–6 digits."})
+                    return
+                code = {"connect": "3", "monitor": "2", "disconnect": "1"}[action]
+                cmd = f"rpt cmd {local_node} ilink {code} {target_node}"
+            proc = subprocess.run(["asterisk", "-rx", cmd], capture_output=True, text=True, timeout=8)
+            if proc.returncode != 0:
+                self._send_json(500, {"error": (proc.stderr or proc.stdout).strip() or "Asterisk command failed."})
+                return
+            self._send_json(200, {"ok": True, "output": (proc.stdout or "Command sent.").strip()})
             return
 
         self._send_json(404, {"error": "Unknown API endpoint."})
@@ -1609,7 +2584,7 @@ def main() -> None:
     if not os.path.isdir(DIST_DIR):
         raise SystemExit(f"Build directory not found: {DIST_DIR}. Run 'npm run build' first.")
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), WebGuiHandler)
-    print(f"MMDVM WebGUI listening on http://0.0.0.0:{PORT} (serving {DIST_DIR})", flush=True)
+    print(f"MMDVM & AllStarLink WebGUI listening on http://0.0.0.0:{PORT} (serving {DIST_DIR})", flush=True)
     server.serve_forever()
 
 
