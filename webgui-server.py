@@ -1292,6 +1292,101 @@ def _unit_exists(unit: str) -> bool:
         return False
 
 
+def _configure_pi_gpio_uart() -> bool:
+    """Configure Raspberry Pi GPIO UART (/dev/ttyAMA0 on pins 14/15) for MMDVM Pi-HATs.
+    Returns True if boot files were modified and a reboot is required."""
+    changed = False
+    boot_dir = None
+    for candidate in ("/boot/firmware", "/boot"):
+        if os.path.isfile(os.path.join(candidate, "config.txt")):
+            boot_dir = candidate
+            break
+
+    if not boot_dir:
+        _append_log("[INFO] No Raspberry Pi /boot/firmware/config.txt found; skipping Pi UART setup.")
+        return False
+
+    model_str = ""
+    try:
+        with open("/proc/device-tree/model", "rb") as f:
+            model_str = f.read().decode("utf-8", errors="ignore").replace("\x00", "").strip()
+    except OSError:
+        pass
+    is_pi5 = "Raspberry Pi 5" in model_str
+
+    if shutil.which("raspi-config"):
+        _append_log("[INFO] Running raspi-config serial hardware enable & serial console disable...")
+        _run_cmd(["raspi-config", "nonint", "do_serial_hw", "0"], check=False)
+        _run_cmd(["raspi-config", "nonint", "do_serial_cons", "1"], check=False)
+
+    cfg_path = os.path.join(boot_dir, "config.txt")
+    try:
+        with open(cfg_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        active_lines = [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+        additions: list[str] = []
+
+        if "enable_uart=1" not in active_lines:
+            additions.append("enable_uart=1")
+
+        if is_pi5:
+            if not any(ln in ("dtparam=uart0=on", "dtoverlay=uart0-pi5") for ln in active_lines):
+                additions.append("dtparam=uart0=on")
+        else:
+            if not any(
+                ln in ("dtoverlay=disable-bt", "dtoverlay=pi3-disable-bt", "dtoverlay=miniuart-bt", "dtoverlay=pi3-miniuart-bt")
+                for ln in active_lines
+            ):
+                additions.append("dtoverlay=disable-bt")
+
+        if additions:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            shutil.copy2(cfg_path, f"{cfg_path}.bak.{ts}")
+            new_content = "\n".join(lines).rstrip("\n") + "\n\n# MMDVM Pi-HAT GPIO UART\n" + "\n".join(additions) + "\n"
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            _append_log(f"[INFO] Updated {cfg_path} with: {', '.join(additions)}")
+            changed = True
+        else:
+            _append_log(f"[INFO] {cfg_path} already has Pi-HAT UART settings configured.")
+    except OSError as exc:
+        _append_log(f"[WARN] Could not update {cfg_path}: {exc}")
+
+    cmdline_path = os.path.join(boot_dir, "cmdline.txt")
+    if os.path.isfile(cmdline_path):
+        try:
+            with open(cmdline_path, "r", encoding="utf-8", errors="replace") as f:
+                raw_cmd = f.read().strip()
+            cleaned_cmd = re.sub(r"\bconsole=(?:serial0|ttyAMA0|ttyS0),\d+\s*", "", raw_cmd)
+            cleaned_cmd = re.sub(r"\s{2,}", " ", cleaned_cmd).strip()
+            if cleaned_cmd != raw_cmd:
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                shutil.copy2(cmdline_path, f"{cmdline_path}.bak.{ts}")
+                with open(cmdline_path, "w", encoding="utf-8") as f:
+                    f.write(cleaned_cmd + "\n")
+                _append_log(f"[INFO] Removed serial console argument from {cmdline_path}")
+                changed = True
+        except OSError as exc:
+            _append_log(f"[WARN] Could not update {cmdline_path}: {exc}")
+
+    units_to_disable = [
+        "serial-getty@ttyAMA0.service",
+        "serial-getty@serial0.service",
+        "serial-getty@ttyS0.service",
+    ]
+    if not is_pi5:
+        units_to_disable.append("hciuart.service")
+    for unit in units_to_disable:
+        _run_cmd(["systemctl", "disable", "--now", unit], check=False)
+
+    if changed:
+        _append_log(
+            "[WARN] Raspberry Pi boot UART configuration was updated. "
+            "A REBOOT (sudo reboot) is required before /dev/ttyAMA0 will talk to your MMDVM Pi-HAT."
+        )
+    return changed
+
+
 def _write_dvswitch_files(cfg: dict, backup_existing: bool = True) -> None:
     dvs = cfg["dvswitch"]
     st = cfg["station"]
@@ -1604,10 +1699,8 @@ def _run_install_worker(cfg: dict) -> None:
         if md["enabled"]:
             _set_step(4, "Clone, Compile & Install g4klx/MMDVMHost")
             _ensure_mmdvm_user_and_dirs()
-            if md["configurePiUart"] and shutil.which("raspi-config"):
-                _append_log("[INFO] Configuring Raspberry Pi hardware UART via raspi-config...")
-                _run_cmd(["raspi-config", "nonint", "do_serial_hw", "0"], check=False)
-                _run_cmd(["raspi-config", "nonint", "do_serial_cons", "1"], check=False)
+            if md["configurePiUart"]:
+                _configure_pi_gpio_uart()
 
             host_src = "/usr/local/src/MMDVMHost"
             if os.path.isdir(host_src):
@@ -1718,6 +1811,8 @@ def _run_apply_config_worker(cfg: dict) -> None:
             _append_log("[INFO] DVSwitch disabled in config; skipping /opt/*_Bridge write.")
 
         if md["enabled"]:
+            if md["configurePiUart"]:
+                _configure_pi_gpio_uart()
             if md["protocol"] == "uart" and not os.path.exists(md["uartPort"]):
                 _append_log(
                     f"[WARN] Serial device {md['uartPort']} does not currently exist on this host. "

@@ -957,6 +957,23 @@ ${
     ? `if command -v raspi-config >/dev/null 2>&1; then
   raspi-config nonint do_serial_hw 0 || true
   raspi-config nonint do_serial_cons 1 || true
+fi
+BOOT_DIR=""
+[[ -f /boot/firmware/config.txt ]] && BOOT_DIR="/boot/firmware"
+[[ -z "\${BOOT_DIR}" && -f /boot/config.txt ]] && BOOT_DIR="/boot"
+if [[ -n "\${BOOT_DIR}" ]]; then
+  grep -Eq '^enable_uart=1' "\${BOOT_DIR}/config.txt" || echo 'enable_uart=1' >> "\${BOOT_DIR}/config.txt"
+  if grep -qi 'Raspberry Pi 5' /proc/device-tree/model 2>/dev/null; then
+    grep -Eq '^dtparam=uart0=on|^dtoverlay=uart0-pi5' "\${BOOT_DIR}/config.txt" || echo 'dtparam=uart0=on' >> "\${BOOT_DIR}/config.txt"
+  else
+    grep -Eq '^dtoverlay=(pi3-)?(disable|miniuart)-bt' "\${BOOT_DIR}/config.txt" || echo 'dtoverlay=disable-bt' >> "\${BOOT_DIR}/config.txt"
+    systemctl disable --now hciuart.service 2>/dev/null || true
+  fi
+  if [[ -f "\${BOOT_DIR}/cmdline.txt" ]]; then
+    sed -i -E 's/console=(serial0|ttyAMA0|ttyS0),[0-9]+ ?//g' "\${BOOT_DIR}/cmdline.txt"
+  fi
+  systemctl disable --now serial-getty@ttyAMA0.service serial-getty@serial0.service serial-getty@ttyS0.service 2>/dev/null || true
+  echo "[INFO] Pi GPIO UART configured in \${BOOT_DIR}/config.txt (reboot required if newly added)."
 fi`
     : '# Pi GPIO UART auto-configuration skipped'
 }
