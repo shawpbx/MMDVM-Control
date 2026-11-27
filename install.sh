@@ -14,7 +14,8 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-REPO_INPUT="${ASL_WEBGUI_REPO:-shawpbx/AllStarLink-Guided-Install-WebGUI}"
+DEFAULT_REPO="shawpbx/AllStarLink-Guided-Install-WebGUI"
+REPO_INPUT="${ASL_WEBGUI_REPO:-}"
 BRANCH="${ASL_WEBGUI_BRANCH:-main}"
 INSTALL_DIR="${ASL_WEBGUI_DIR:-/opt/allstarlink-webgui}"
 WEBGUI_PORT="${ASL_WEBGUI_PORT:-8080}"
@@ -85,6 +86,10 @@ if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]:-}" ]]; then
   fi
 fi
 
+if [[ -z "${REPO_INPUT}" && "${LOCAL_SOURCE}" -eq 0 ]]; then
+  REPO_INPUT="${DEFAULT_REPO}"
+fi
+
 normalize_repo_url() {
   local raw="$1"
   if [[ -z "${raw}" ]]; then
@@ -128,12 +133,16 @@ fi
 
 # Clone from GitHub or sync from local git checkout
 if [[ -n "${REPO_URL}" ]]; then
+  EXISTING_ORIGIN=""
   if [[ -d "${INSTALL_DIR}/.git" ]]; then
+    EXISTING_ORIGIN="$(git -C "${INSTALL_DIR}" remote get-url origin 2>/dev/null || true)"
+  fi
+  if [[ -d "${INSTALL_DIR}/.git" && "${EXISTING_ORIGIN}" == "${REPO_URL}" ]]; then
     echo "[INFO] Updating existing checkout in ${INSTALL_DIR} (${BRANCH})..."
     git -C "${INSTALL_DIR}" config core.fileMode false
     git -C "${INSTALL_DIR}" fetch origin "${BRANCH}"
     git -C "${INSTALL_DIR}" checkout "${BRANCH}"
-    git -C "${INSTALL_DIR}" pull --ff-only origin "${BRANCH}"
+    git -C "${INSTALL_DIR}" reset --hard "origin/${BRANCH}"
   else
     echo "[INFO] Cloning ${REPO_URL} (${BRANCH}) into ${INSTALL_DIR}..."
     rm -rf "${INSTALL_DIR}"
@@ -189,6 +198,13 @@ EOF_SVC
 systemctl daemon-reload
 systemctl enable --now asl-webgui.service
 systemctl restart asl-webgui.service
+sleep 2
+
+if ! systemctl is-active --quiet asl-webgui.service; then
+  echo "[ERROR] asl-webgui.service failed to stay running. Recent logs:"
+  journalctl -u asl-webgui.service -n 25 --no-pager || true
+  exit 1
+fi
 
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
   ufw allow "${WEBGUI_PORT}/tcp" comment 'AllStarLink Guided Install WebGUI' || true
@@ -198,6 +214,7 @@ NODE_IP="$(hostname -I | awk '{print $1}')"
 echo ""
 echo "========================================================================"
 echo " AllStarLink Guided Install WebGUI installed from GitHub"
+echo " Repo        : ${REPO_URL:-local}"
 echo " Install Dir : ${INSTALL_DIR}"
 echo " Service     : systemctl status asl-webgui"
 echo " WebGUI URL  : http://${NODE_IP:-localhost}:${WEBGUI_PORT}"
