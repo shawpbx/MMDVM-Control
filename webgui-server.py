@@ -972,8 +972,12 @@ NetModeHang=3
 Daemon=0
 
 [Log]
-MQTTLevel=0
 DisplayLevel=1
+FileLevel=1
+FilePath=/var/log/mmdvm
+FileRoot=MMDVM
+FileRotate=1
+MQTTLevel=0
 
 [MQTT]
 Host=127.0.0.1
@@ -1082,10 +1086,11 @@ Debug=0
 
 [DMR Network]
 Enable={'1' if nw['dmrEnable'] else '0'}
+Type=Gateway
 LocalAddress=127.0.0.1
 LocalPort=62033
-GatewayAddress=127.0.0.1
-GatewayPort=62031
+RemoteAddress=127.0.0.1
+RemotePort=62031
 Jitter=360
 Slot1={'1' if (st['duplex'] and nw['dmrSlot1']) else '0'}
 Slot2={'1' if nw['dmrSlot2'] else '0'}
@@ -1144,6 +1149,10 @@ Debug=0
 
 [Log]
 DisplayLevel=1
+FileLevel=1
+FilePath=/var/log/mmdvm
+FileRoot=DMRGateway
+FileRotate=1
 MQTTLevel=0
 
 [Voice]
@@ -1232,12 +1241,32 @@ Enable=0
             else:
                 Path(dst).touch()
 
+    for log_file in ("/var/log/mmdvm/MMDVMHost.log", "/var/log/mmdvm/DMRGateway.log"):
+        Path(log_file).touch(exist_ok=True)
     _run_cmd(["chown", "-R", "mmdvm:mmdvm", "/etc/mmdvm", "/var/log/mmdvm"], check=False)
     try:
         os.chmod("/etc/mmdvm/DMRGateway.ini", 0o640)
     except OSError:
         pass
     _append_log("[INFO] Wrote /etc/mmdvm/MMDVM.ini and /etc/mmdvm/DMRGateway.ini")
+
+    logrotate_cfg = """/var/log/mmdvm/*.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su mmdvm mmdvm
+}
+"""
+    try:
+        os.makedirs("/etc/logrotate.d", exist_ok=True)
+        with open("/etc/logrotate.d/mmdvm", "w", encoding="utf-8") as fh:
+            fh.write(logrotate_cfg)
+    except OSError as exc:
+        _append_log(f"[WARN] Could not write /etc/logrotate.d/mmdvm: {exc}")
 
     dmrgw_svc = """[Unit]
 Description=DMRGateway Digital Voice Network Bridge
@@ -1248,6 +1277,9 @@ Wants=network-online.target
 Type=simple
 User=mmdvm
 Group=mmdvm
+LogsDirectory=mmdvm
+StandardOutput=append:/var/log/mmdvm/DMRGateway.log
+StandardError=append:/var/log/mmdvm/DMRGateway.log
 ExecStart=/usr/local/bin/DMRGateway /etc/mmdvm/DMRGateway.ini
 Restart=on-failure
 RestartSec=5
@@ -1255,7 +1287,13 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 """
-    mmdvm_svc = """[Unit]
+    gpio_reset_line = ""
+    if md["protocol"] == "uart" and md["configurePiUart"] and md["uartPort"] in ("/dev/ttyAMA0", "/dev/serial0"):
+        gpio_reset_line = (
+            "ExecStartPre=+-/bin/sh -c 'if command -v pinctrl >/dev/null 2>&1; then "
+            "pinctrl set 20 op dl; pinctrl set 21 op dl; sleep 0.2; pinctrl set 21 ip; sleep 1; fi'\n"
+        )
+    mmdvm_svc = f"""[Unit]
 Description=MMDVMHost Digital Voice RF Modem Service
 After=network-online.target dmrgateway.service
 Wants=network-online.target dmrgateway.service
@@ -1265,7 +1303,10 @@ Type=simple
 User=mmdvm
 Group=mmdvm
 SupplementaryGroups=dialout
-ExecStart=/usr/local/bin/MMDVMHost /etc/mmdvm/MMDVM.ini
+LogsDirectory=mmdvm
+StandardOutput=append:/var/log/mmdvm/MMDVMHost.log
+StandardError=append:/var/log/mmdvm/MMDVMHost.log
+{gpio_reset_line}ExecStart=/usr/local/bin/MMDVMHost /etc/mmdvm/MMDVM.ini
 Restart=on-failure
 RestartSec=5
 
@@ -1276,7 +1317,7 @@ WantedBy=multi-user.target
         fh.write(dmrgw_svc)
     with open("/etc/systemd/system/mmdvmhost.service", "w", encoding="utf-8") as fh:
         fh.write(mmdvm_svc)
-    _append_log("[INFO] Wrote dmrgateway.service and mmdvmhost.service")
+    _append_log("[INFO] Wrote dmrgateway.service, mmdvmhost.service, and /etc/logrotate.d/mmdvm")
 
 
 def _unit_exists(unit: str) -> bool:
@@ -1290,6 +1331,30 @@ def _unit_exists(unit: str) -> bool:
         return bool(proc.stdout.strip())
     except Exception:
         return False
+
+
+def _set_system_hostname(hostname: str) -> None:
+    _run_cmd(["hostnamectl", "set-hostname", hostname], check=False)
+    hosts_path = "/etc/hosts"
+    try:
+        lines = []
+        if os.path.isfile(hosts_path):
+            with open(hosts_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        replaced = False
+        new_lines: list[str] = []
+        for ln in lines:
+            if re.match(r"^\s*127\.0\.1\.1\s+", ln):
+                new_lines.append(f"127.0.1.1\t{hostname}")
+                replaced = True
+            else:
+                new_lines.append(ln)
+        if not replaced:
+            new_lines.append(f"127.0.1.1\t{hostname}")
+        with open(hosts_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(new_lines).rstrip("\n") + "\n")
+    except OSError as exc:
+        _append_log(f"[WARN] Could not update /etc/hosts for hostname {hostname}: {exc}")
 
 
 def _configure_pi_gpio_uart() -> bool:
@@ -1599,12 +1664,7 @@ def _log_service_health_snapshot(units: list[str]) -> None:
         st = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True).stdout.strip() or "inactive"
         _append_log(f"[STATUS] {unit}.service -> {st}")
         if st != "active":
-            j = subprocess.run(
-                ["journalctl", "-u", unit, "-n", "8", "--no-pager", "-o", "cat"],
-                capture_output=True,
-                text=True,
-            )
-            for line in j.stdout.splitlines():
+            for line in _get_journal_lines(unit, 8):
                 if line.strip():
                     _append_log(f"  [{unit}] {line.strip()}")
 
@@ -1624,7 +1684,7 @@ def _run_install_worker(cfg: dict) -> None:
         # 1. System Dependencies & Host Settings
         _set_step(1, "Install System Dependencies & Configure Host")
         _save_config(cfg)
-        _run_cmd(["hostnamectl", "set-hostname", sy["hostname"]], check=False)
+        _set_system_hostname(sy["hostname"])
         _run_cmd(["timedatectl", "set-timezone", sy["timezone"]], check=False)
         _run_cmd(["apt-get", "update", "-y"], env=env)
         _run_cmd(
@@ -1795,7 +1855,7 @@ def _run_apply_config_worker(cfg: dict) -> None:
         # 1. Save config & update host settings (NO apt/compile!)
         _set_step(1, "Save Configuration & Update Host Settings")
         _save_config(cfg)
-        _run_cmd(["hostnamectl", "set-hostname", sy["hostname"]], check=False)
+        _set_system_hostname(sy["hostname"])
         _run_cmd(["timedatectl", "set-timezone", sy["timezone"]], check=False)
 
         # 2. Write AllStarLink, DVSwitch & MMDVM config files (no reinstall)
@@ -2114,7 +2174,45 @@ def _parse_log_timestamp(line: str) -> tuple[str, float]:
     return "—", time.time()
 
 
+def _read_tail_lines(path: Path, count: int) -> list[str]:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            chunk = min(size, max(32768, count * 256))
+            fh.seek(size - chunk)
+            text = fh.read().decode("utf-8", errors="replace")
+        return text.splitlines()[-count:]
+    except OSError:
+        return []
+
+
+def _get_mmdvm_file_lines(unit: str, count: int) -> list[str]:
+    log_dir = Path("/var/log/mmdvm")
+    if not log_dir.is_dir():
+        return []
+    patterns = {
+        "mmdvmhost": ("MMDVMHost.log", "MMDVM-*.log"),
+        "dmrgateway": ("DMRGateway.log", "DMRGateway-*.log"),
+        "mmdvm_bridge": ("MMDVM_Bridge-*.log", "MMDVM_Bridge.log"),
+    }.get(unit)
+    if not patterns:
+        return []
+    candidates: list[Path] = []
+    for pat in patterns:
+        for p in log_dir.glob(pat):
+            if p.is_file() and p.stat().st_size > 0:
+                candidates.append(p)
+    if not candidates:
+        return []
+    newest = max(candidates, key=lambda p: p.stat().st_mtime)
+    return _read_tail_lines(newest, count)
+
+
 def _get_journal_lines(unit: str, count: int = 120) -> list[str]:
+    file_lines = _get_mmdvm_file_lines(unit, count)
+    if file_lines:
+        return file_lines
     try:
         proc = subprocess.run(
             ["journalctl", "-u", unit, "-n", str(count), "--no-pager", "-o", "short-iso"],

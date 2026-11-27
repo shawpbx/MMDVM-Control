@@ -36,8 +36,12 @@ Daemon=0
 
 [Log]
 ; 0=No logging, 1=Debug, 2=Message, 3=Info, 4=Warning, 5=Error, 6=Fatal
-MQTTLevel=0
 DisplayLevel=1
+FileLevel=1
+FilePath=/var/log/mmdvm
+FileRoot=MMDVM
+FileRotate=1
+MQTTLevel=0
 
 [MQTT]
 Host=127.0.0.1
@@ -146,10 +150,11 @@ Debug=0
 
 [DMR Network]
 Enable=${networks.dmrEnable ? '1' : '0'}
+Type=Gateway
 LocalAddress=127.0.0.1
 LocalPort=62033
-GatewayAddress=127.0.0.1
-GatewayPort=62031
+RemoteAddress=127.0.0.1
+RemotePort=62031
 Jitter=360
 Slot1=${station.duplex && networks.dmrSlot1 ? '1' : '0'}
 Slot2=${networks.dmrSlot2 ? '1' : '0'}
@@ -222,6 +227,10 @@ Debug=0
 
 [Log]
 DisplayLevel=1
+FileLevel=1
+FilePath=/var/log/mmdvm
+FileRoot=DMRGateway
+FileRotate=1
 MQTTLevel=0
 
 [Voice]
@@ -297,7 +306,15 @@ Enable=0
 `;
 }
 
-export function generateMmdvmServiceUnit(): string {
+export function generateMmdvmServiceUnit(config?: MmdvmConfiguration): string {
+  const needsPiReset =
+    !config ||
+    (config.modem.protocol === 'uart' &&
+      config.modem.configurePiUart &&
+      (config.modem.uartPort === '/dev/ttyAMA0' || config.modem.uartPort === '/dev/serial0'));
+  const gpioResetLine = needsPiReset
+    ? `ExecStartPre=+-/bin/sh -c 'if command -v pinctrl >/dev/null 2>&1; then pinctrl set 20 op dl; pinctrl set 21 op dl; sleep 0.2; pinctrl set 21 ip; sleep 1; fi'\n`
+    : '';
   return `[Unit]
 Description=MMDVMHost Digital Voice RF Modem Service
 After=network-online.target dmrgateway.service
@@ -308,7 +325,10 @@ Type=simple
 User=mmdvm
 Group=mmdvm
 SupplementaryGroups=dialout
-ExecStart=/usr/local/bin/MMDVMHost /etc/mmdvm/MMDVM.ini
+LogsDirectory=mmdvm
+StandardOutput=append:/var/log/mmdvm/MMDVMHost.log
+StandardError=append:/var/log/mmdvm/MMDVMHost.log
+${gpioResetLine}ExecStart=/usr/local/bin/MMDVMHost /etc/mmdvm/MMDVM.ini
 Restart=on-failure
 RestartSec=5
 
@@ -327,6 +347,9 @@ Wants=network-online.target
 Type=simple
 User=mmdvm
 Group=mmdvm
+LogsDirectory=mmdvm
+StandardOutput=append:/var/log/mmdvm/DMRGateway.log
+StandardError=append:/var/log/mmdvm/DMRGateway.log
 ExecStart=/usr/local/bin/DMRGateway /etc/mmdvm/DMRGateway.ini
 Restart=on-failure
 RestartSec=5
@@ -1016,7 +1039,23 @@ cat <<'EOF_DMRGW_SVC' > /etc/systemd/system/dmrgateway.service
 ${generateDmrGatewayServiceUnit()}EOF_DMRGW_SVC
 
 cat <<'EOF_MMDVM_SVC' > /etc/systemd/system/mmdvmhost.service
-${generateMmdvmServiceUnit()}EOF_MMDVM_SVC
+${generateMmdvmServiceUnit(config)}EOF_MMDVM_SVC
+
+touch /var/log/mmdvm/MMDVMHost.log /var/log/mmdvm/DMRGateway.log
+chown -R mmdvm:mmdvm /etc/mmdvm /var/log/mmdvm
+
+cat <<'EOF_LOGROTATE' > /etc/logrotate.d/mmdvm
+/var/log/mmdvm/*.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su mmdvm mmdvm
+}
+EOF_LOGROTATE
 
 systemctl daemon-reload
 ${networks.dmrEnable ? 'systemctl enable --now dmrgateway.service\nsystemctl restart dmrgateway.service' : 'systemctl disable --now dmrgateway.service 2>/dev/null || true'}
@@ -1077,7 +1116,7 @@ export function generateAllFiles(config: MmdvmConfiguration): GeneratedFile[] {
         language: 'systemd',
         category: 'MMDVM',
         description: 'Systemd service unit running MMDVMHost under the mmdvm user in group dialout',
-        content: generateMmdvmServiceUnit(),
+        content: generateMmdvmServiceUnit(config),
       },
       {
         id: 'dmrgateway-service',

@@ -1,27 +1,27 @@
-# AllStarLink Guided Install WebGUI
+# MMDVM / AllStarLink 3 / DVSwitch Control WebGUI
 
-Interactive dashboard, configuration wizard, and automated node installer for **AllStarLink 3 (ASL3)**, **DVSwitch Server**, and **MMDVMHost** on fresh **Raspberry Pi OS** (Bookworm / Trixie 64-bit) and **Debian 13 (Trixie)** nodes.
+Authenticated WebGUI installer, live status dashboard, and post-install configurator for **MMDVMHost / DMRGateway**, **AllStarLink 3 (ASL3)**, and **DVSwitch** (`Analog_Bridge`, `MMDVM_Bridge`, `md380-emu`) on **Raspberry Pi OS** (Bookworm / Trixie 64-bit) and **Debian 12/13**.
 
-## GitHub Installation (Raspberry Pi / Debian 13)
+## GitHub Installation (Raspberry Pi / Debian)
 
-### Option 1: One-Line GitHub Install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/shawpbx/AllStarLink-Guided-Install-WebGUI/main/install.sh | sudo bash
-```
-
-Custom port example (`--port 8080`):
+### Option 1: Git Clone & Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shawpbx/AllStarLink-Guided-Install-WebGUI/main/install.sh | sudo bash -s -- --port 8080
-```
-
-### Option 2: Git Clone & Install
-
-```bash
-git clone https://github.com/shawpbx/AllStarLink-Guided-Install-WebGUI.git
-cd AllStarLink-Guided-Install-WebGUI
+git clone https://github.com/shawpbx/MMDVM-Control.git
+cd MMDVM-Control
 sudo bash install.sh
+```
+
+If port `8080` is already in use on your Pi (for example by DVSwitch `webproxy`), pass `--port 8081`:
+
+```bash
+sudo bash install.sh --port 8081
+```
+
+### Option 2: One-Line GitHub Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shawpbx/MMDVM-Control/main/install.sh | sudo bash
 ```
 
 Once installed, open the WebGUI in your browser at:
@@ -29,24 +29,6 @@ Once installed, open the WebGUI in your browser at:
 ```text
 http://<node-ip>:8080
 ```
-
-## Direct On-Node Installation
-
-When running the WebGUI directly on your Raspberry Pi or Debian 13 node:
-
-1. Configure your AllStarLink 3, DVSwitch Server, and MMDVMHost settings in the **Configure** tab.
-2. Click **Install on This Node** (or finish Step 5).
-3. On first use, set a local admin password (stored as a salted scrypt hash in `/etc/allstarlink-webgui/admin.hash`, or override via `ASL_WEBGUI_ADMIN_PASSWORD`).
-4. Click **Run Install Now** to execute the full installation directly on the node with live progress and log streaming—no script download or `scp` required.
-
-## Official Raspberry Pi ASL3 Appliance Image
-
-If starting from a blank SD card on Raspberry Pi 5, 4, 3, or Zero 2 W, you can flash the official **AllStarLink 3 (Trixie)** appliance image first:
-
-1. Open **Raspberry Pi Imager** → **App Options** → **Content Repository** → **Use custom URL**.
-2. Enter `https://rpi.allstarlink.org/latest.json` and click **Apply & Restart**.
-3. Select your Raspberry Pi model and flash **AllStarLink (Trixie)**.
-4. Boot the Pi, run the GitHub one-line install above, and use **Install on This Node** (existing ASL3 packages are detected automatically while writing your node configs and installing optional DVSwitch / MMDVMHost).
 
 ## Updating from GitHub
 
@@ -62,12 +44,14 @@ sudo bash install.sh
 sudo bash /opt/allstarlink-webgui/install.sh --uninstall
 ```
 
-## What the Node Installer Configures
+## Key Features
 
-- **AllStarLink 3 (`asl3`, `asl3-asterisk`, `asl3-menu`)**: Generates `/etc/asterisk/rpt.conf`, `iax.conf`, `extensions.conf`, `simpleusb.conf`, and `manager.conf` with clean operator-supplied node numbers and secrets.
-- **DVSwitch Server (`mmdvm-bridge`, `analog-bridge`, `md380-emu`)**: Optional private-node (`chan_usrp`) or direct USRP bridging to DMR, YSF, P25, NXDN, and D-Star networks.
-- **MMDVMHost (`g4klx/MMDVMHost`)**: Optional source build from GitHub with Raspberry Pi GPIO UART configuration (`/dev/ttyAMA0`), `/etc/mmdvm/MMDVM.ini`, `DMRIds.dat`, and `mmdvmhost.service`.
-- **On-Node HTML Dashboard & Security**: Deploys `asl-dashboard.service` along with optional Allmon3, Cockpit, UFW firewall rules, and Fail2Ban.
+- **Authenticated Login**: First-run administrator setup with salted scrypt password hashing (`/etc/mmdvm-webgui/admin.json`) and rate-limited sessions.
+- **Separate Configuration Tabs**: Dedicated tabs for **MMDVM** (Station, Modem & Pi-HAT presets, Digital Networks), **AllStarLink 3** (Nodes, Radio & AMI), **DVSwitch Bridge** (USRP & Digital Bridge), and **System & Firewall**.
+- **Pre-Install & Fast Post-Install Apply**: Run the full 6-step on-node installer once, then apply configuration edits directly to config files and reload services without reinstalling packages.
+- **Raspberry Pi MMDVM Pi-HAT Support**: Automatically enables hardware UART (`enable_uart=1`, `dtoverlay=disable-bt` on Pi 3/4/Zero 2 W or `dtparam=uart0=on` on Pi 5), disables serial console, and adds a GPIO 20/21 STM32 reset `ExecStartPre` hook in `mmdvmhost.service`.
+- **Persistent Logs in `/var/log/mmdvm/`**: Writes `MMDVMHost.log`, `DMRGateway.log`, and `MMDVM_Bridge-*.log` under `/var/log/mmdvm/` with daily logrotate retention (`/etc/logrotate.d/mmdvm`).
+- **Live Status Dashboard**: Shows live AllStarLink connected nodes (with quick connect/monitor/disconnect & DVSwitch bridge linking), active & recent MMDVM users, service controls, and live logs.
 
 ## Local Development
 

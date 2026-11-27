@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
-# AllStarLink Guided Install WebGUI — GitHub Bootstrap Installer
-# Targets: Raspberry Pi OS (Bookworm / Trixie 64-bit) & Debian 13 (Trixie)
+# MMDVM / AllStarLink / DVSwitch Control WebGUI — GitHub Bootstrap Installer
+# Targets: Raspberry Pi OS (Bookworm / Trixie 64-bit) & Debian 12/13
 # Usage:
-#   git clone https://github.com/shawpbx/AllStarLink-Guided-Install-WebGUI.git && cd AllStarLink-Guided-Install-WebGUI && sudo bash install.sh
-#   curl -fsSL https://raw.githubusercontent.com/shawpbx/AllStarLink-Guided-Install-WebGUI/main/install.sh | sudo bash
+#   git clone https://github.com/shawpbx/MMDVM-Control.git && cd MMDVM-Control && sudo bash install.sh
+#   curl -fsSL https://raw.githubusercontent.com/shawpbx/MMDVM-Control/main/install.sh | sudo bash
 # ============================================================================
 
 set -euo pipefail
@@ -14,7 +14,7 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-DEFAULT_REPO="shawpbx/AllStarLink-Guided-Install-WebGUI"
+DEFAULT_REPO="shawpbx/MMDVM-Control"
 REPO_INPUT="${ASL_WEBGUI_REPO:-}"
 BRANCH="${ASL_WEBGUI_BRANCH:-main}"
 INSTALL_DIR="${ASL_WEBGUI_DIR:-/opt/allstarlink-webgui}"
